@@ -18,7 +18,7 @@ cookie un año). Una terminal por red = control total de esta máquina: el PIN
 no es decorativo.
 
 Uso:  python3 serve_sesiones.py            # http://127.0.0.1:8811
-      CACHO_PORT=9000 python3 serve_sesiones.py   # otro puerto
+      CACHO_PORT=9000 python3 serve_sesiones.py   # otro puerto (tests)
 """
 import base64
 import fcntl
@@ -1140,15 +1140,16 @@ body{
 }
 #terms.arrastrando .term-box.ver{outline:2px dashed var(--coral); outline-offset:-6px}
 /* ---------- dictado por micrófono (escritorio, Chrome) ---------- */
-#btn-mic{
-  position:absolute; right:28px; bottom:28px; z-index:12; display:none;
-  width:46px; height:46px; border-radius:50%; border:1px solid var(--borde);
-  background:var(--card); color:var(--coral); font-size:20px; cursor:pointer;
+#btn-mic, #btn-enviar-esc{
+  position:absolute; bottom:28px; z-index:12; display:none;
+  width:46px; height:46px; border-radius:50%; cursor:pointer;
   box-shadow:0 4px 16px rgba(0,0,0,.25); align-items:center; justify-content:center;
 }
-#btn-mic.ver{display:flex}
-#btn-mic:hover{filter:brightness(.97)}
-#btn-mic.grabando{background:var(--coral); color:#fff; animation:lat 1.4s ease-in-out infinite}
+#btn-mic{right:84px; border:1px solid var(--borde); background:var(--card); color:var(--gris)}
+#btn-enviar-esc{right:28px; border:none; background:var(--coral); color:#fff}
+#btn-mic.ver, #btn-enviar-esc.ver{display:flex}
+#btn-mic:hover, #btn-enviar-esc:hover{filter:brightness(.97)}
+#btn-mic.grabando{background:var(--coral); border-color:var(--coral); color:#fff; animation:lat 1.4s ease-in-out infinite}
 #mic-live{
   position:absolute; right:28px; bottom:84px; z-index:12; max-width:440px;
   background:var(--card); border:1px solid var(--borde); border-radius:12px;
@@ -1157,7 +1158,7 @@ body{
 }
 #mic-live.ver{display:block}
 #mic-live .int{color:var(--gris); font-style:italic}
-@media (max-width:700px){ #btn-mic, #mic-live{display:none !important} }
+@media (max-width:700px){ #btn-mic, #btn-enviar-esc, #mic-live{display:none !important} }
 /* ---------- SOLO TELÉFONO (≤700px): el escritorio no entra acá ----------
    Estética tipo app de Claude en iOS: barra superior con ☰, la lista de
    sesiones es un cajón que se desliza desde la izquierda con velo detrás. */
@@ -1263,7 +1264,8 @@ body{
 <div id="main">
   <div id="terms">
     <div id="vacio"><img src="/static/cacho.png" style="width:84px;height:84px;border-radius:50%">Abrí una sesión nueva o elegí una de la izquierda.</div>
-    <button id="btn-mic" title="Dictar por micrófono">🎤</button>
+    <button id="btn-mic" title="Dictar por micrófono"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg></button>
+    <button id="btn-enviar-esc" title="Enviar (Enter en la sesión activa)"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg></button>
     <div id="mic-live"></div>
   </div>
   <div id="input-m">
@@ -1353,16 +1355,15 @@ function abrirTab(id){
     method:"POST", body: JSON.stringify({cols, rows})
   }).catch(()=>{}));
   abiertas[id] = {term, fit, es:null, box};
-  conectar(id);
-  activar(id);
+  activar(id);   // conecta el stream (y corta el de la pestaña que deja atrás)
 }
 
-// stream SSE de una pestaña. OJO iOS: Safari corta a ~6 conexiones por host,
-// y cada stream abierto es una conexión que no se suelta — con varias
-// sesiones tocadas el teléfono se quedaba SIN conexiones y todo lo demás
-// (crear sesión, escribir, refrescar) se colgaba mudo. Por eso en el
-// teléfono se mantiene abierto SOLO el stream de la sesión activa (ver
-// activar()); al volver a conectar, el server re-manda el buffer entero.
+// stream SSE de una pestaña. OJO: los navegadores cortan a ~6 conexiones
+// por host (Safari iOS Y TAMBIÉN Chrome escritorio — visto 13-ago: con 6
+// sesiones abiertas en la ventana de Cacho el pool quedó agotado y crear
+// otra colgaba TODO mudo), y cada stream abierto es una conexión que no se
+// suelta. Por eso se mantiene abierto SOLO el stream de la sesión activa
+// (ver activar()); al volver a conectar, el server re-manda el buffer entero.
 function conectar(id){
   const a = abiertas[id];
   if(!a || a.es) return;
@@ -1382,12 +1383,10 @@ function desconectar(id){
 
 function activar(id){
   activa = id;
-  if(MOVIL){
-    // una sola conexión de stream viva (ver conectar()): se corta la de las
-    // demás pestañas y se (re)conecta la activa
-    Object.keys(abiertas).forEach(k => { if(k !== id) desconectar(k); });
-    if(id && abiertas[id]) conectar(id);
-  }
+  // una sola conexión de stream viva (ver conectar()): se corta la de las
+  // demás pestañas y se (re)conecta la activa — escritorio Y teléfono
+  Object.keys(abiertas).forEach(k => { if(k !== id) desconectar(k); });
+  if(id && abiertas[id]) conectar(id);
   if(MOVIL && id) menu(false);   // elegiste sesión: el cajón se guarda solo
   document.querySelectorAll(".term-box, .ver-box").forEach(b =>
     b.classList.toggle("ver", b.dataset.id === id));
@@ -1686,15 +1685,19 @@ if(MOVIL){
 /* ---- dictado por micrófono (escritorio): Web Speech API de Chrome ----
    Igual que el micrófono de WhatsApp: tocás el botón, hablás, volvés a tocar.
    El texto entra en la sesión activa con bracketed paste SIN Enter: lo
-   revisás y lo mandás con ⏎ (mismo comportamiento que el dictado de macOS).
+   revisás y lo mandás con ⏎ o con el botón de enviar de al lado (mismo
+   comportamiento que el dictado de macOS).
    Chrome sobre 127.0.0.1 es "secure context", así que la API anda en la
    ventana de Cacho.app; en el teléfono el botón no aparece (el teclado de
    iOS ya trae su micrófono y dicta en la barra de abajo). */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
 let mic = null, micActivo = false, micFinal = "", micTab = null;
 function micVisible(){
+  const hay = !MOVIL && !!activa && !!abiertas[activa];
   const b = $("#btn-mic");
-  if(b) b.classList.toggle("ver", !MOVIL && !!SR && !!activa && !!abiertas[activa]);
+  if(b) b.classList.toggle("ver", hay && !!SR);
+  const e = $("#btn-enviar-esc");
+  if(e) e.classList.toggle("ver", hay);
 }
 function micPintar(interim){
   const el = $("#mic-live");
@@ -1750,6 +1753,19 @@ function micArrancar(){
   try{ mic.start(); }catch(e){ micActivo = false; $("#btn-mic").classList.remove("grabando"); }
 }
 $("#btn-mic").addEventListener("click", () => micActivo ? micParar() : micArrancar());
+
+// botón de enviar (estilo app de Claude): manda Enter a la sesión activa,
+// para poder operar SOLO con el mouse (dictás con el mic, mandás con la
+// flecha). Si estabas grabando, primero corta y pega lo dictado; el Enter
+// va un toque después, para que el TUI de claude digiera el paste.
+$("#btn-enviar-esc").addEventListener("click", () => {
+  const id = micTab || activa;
+  if(!id || !abiertas[id]) return;
+  const demora = micActivo ? 350 : 0;
+  if(micActivo) micParar();
+  setTimeout(() => fetch(`/api/term/${id}/input`, {method:"POST",
+    body: JSON.stringify({d: b64de("\r")})}).catch(()=>{}), demora);
+});
 
 /* ---- drag & drop de archivos: guardar y pegar la ruta en la terminal ---- */
 ["dragover", "dragenter"].forEach(ev =>
