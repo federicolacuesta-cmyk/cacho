@@ -1612,11 +1612,19 @@ function mandar(raw){
 }
 function enviarTexto(){
   const ta = $("#texto-m");
-  if(!ta.value.trim()) return;
-  // bracketed paste: el texto entra entero (con saltos de línea incluidos)
-  // y el \r final lo envía — igual que pegar y dar Enter
-  mandar("\x1b[200~" + ta.value + "\x1b[201~\r");
-  ta.value = ""; ta.style.height = "auto";
+  // El dictado de iOS escribe texto "provisorio" (marked text) que recién se
+  // confirma al cerrar el dictado. Si se lee ta.value en el medio, se manda
+  // una hipótesis vieja y el resto se pierde (mensajes truncados).
+  // blur() obliga a iOS a confirmar lo dictado; el valor se lee un tick después.
+  ta.blur();
+  setTimeout(() => {
+    if(!ta.value.trim()){ ta.focus(); return; }
+    // bracketed paste: el texto entra entero (con saltos de línea incluidos)
+    // y el \r final lo envía — igual que pegar y dar Enter
+    mandar("\x1b[200~" + ta.value + "\x1b[201~\r");
+    ta.value = ""; ta.style.height = "auto";
+    ta.focus();   // mejor esfuerzo por dejar el teclado abierto, como antes
+  }, 150);
 }
 if(MOVIL){
   const ta = $("#texto-m");
