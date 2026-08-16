@@ -360,6 +360,25 @@ def procesos_claude(ttys_excluidos):
 # Terminales de la app (PTY + zsh + claude)
 # ---------------------------------------------------------------------------
 
+MODELO_PATH = os.path.expanduser("~/.cacho_modelo")
+_MODELO_OK = re.compile(r"^[A-Za-z0-9._\[\]-]{1,64}$")
+
+
+def _modelo_preferido():
+    """Modelo con el que arrancan las pestañas nuevas, o "" para el default.
+
+    Lo escribe `tools/vigia_fable.py`. Se relee en cada pestaña a propósito: el vigía
+    puede cambiarlo con el server ya andando. Si el contenido tiene cualquier cosa rara
+    se ignora — este texto termina en una línea de comando.
+    """
+    try:
+        with open(MODELO_PATH) as f:
+            modelo = f.read().strip()
+    except Exception:
+        return ""
+    return modelo if _MODELO_OK.match(modelo) else ""
+
+
 class TermSession:
     def __init__(self, cwd, resume_id=""):
         self.id = uuid.uuid4().hex[:8]
@@ -407,6 +426,15 @@ class TermSession:
         # está ahí, decirlo en pantalla en vez de dejar la pestaña negra.
         # resume_id ya viene validado ([0-9a-f-]): seguro para la línea de comando
         claude = ("claude --resume " + self.resume_id) if self.resume_id else "claude"
+        # El modelo lo decide `tools/vigia_fable.py`: escribe ~/.cacho_modelo con Fable 5
+        # cuando el cupo semanal está vivo y con Opus 5 cuando se agota. Sin archivo, el
+        # comportamiento es el de siempre (el default de la máquina). Se valida el
+        # contenido porque va a una línea de comando.
+        modelo = _modelo_preferido()
+        if modelo:
+            # entre comillas SIEMPRE: el sufijo de contexto va entre corchetes
+            # (`claude-opus-5[1m]`) y zsh lo toma como glob → "no matches found".
+            claude += " --model '" + modelo + "'"
         cmd = (
             'PATH="$HOME/.local/bin:$HOME/.claude/local:'
             '/opt/homebrew/bin:/usr/local/bin:$PATH"; '
@@ -2334,30 +2362,49 @@ setInterval(chequearBoot, 15000);
 document.addEventListener("dragleave", e => {
   if(!e.relatedTarget) $("#terms").classList.remove("arrastrando");
 });
+// Después de soltar un archivo, el foco NO queda en la terminal: Chrome se lo
+// deja al documento y había que dar un click adentro para que el Enter cayera
+// en la sesión (queja de 16-ago-2026). Un solo focus() no alcanza — el
+// navegador termina de digerir el drop DESPUÉS de nuestro handler y lo pisa.
+// Por eso se insiste unas cuantas veces durante medio segundo.
+function enfocarSesion(){
+  const a = abiertas[activa];
+  if(!a) return;
+  [0, 60, 180, 400].forEach(ms => setTimeout(() => {
+    try{ window.focus(); a.term.focus(); }catch(e){}
+  }, ms));
+}
+
 document.addEventListener("drop", async e => {
   e.preventDefault();  // sin esto Chrome navega al archivo y "te lo tira afuera"
   $("#terms").classList.remove("arrastrando");
-  if(!activa || !abiertas[activa]) return;
+  if(!activa || !abiertas[activa]){ aviso("Abrí una sesión antes de soltar el archivo", true); return; }
   const files = [...(e.dataTransfer.files || [])];
-  let pegar = "";
+  let pegar = "", fallaron = 0;
   if(files.length){
+    aviso(files.length === 1 ? "Subiendo " + files[0].name + "…"
+                             : "Subiendo " + files.length + " archivos…");
     for(const f of files){
       try{
         const r = await fetch("/api/subir?nombre=" + encodeURIComponent(f.name),
                               {method:"POST", body: f});
         const j = await r.json();
-        if(j.ruta) pegar += '"' + j.ruta + '" ';
-      }catch(err){}
+        if(j.ruta) pegar += '"' + j.ruta + '" '; else fallaron++;
+      }catch(err){ fallaron++; }
     }
   } else {
     pegar = e.dataTransfer.getData("text") || "";
   }
-  if(pegar){
-    fetch(`/api/term/${activa}/input`, {
-      method:"POST", body: JSON.stringify({d: b64de(pegar)})
-    }).catch(()=>{});
-    abiertas[activa].term.focus();
+  if(!pegar){
+    if(files.length) aviso("No pude subir " + (files.length === 1 ? "el archivo" : "ningún archivo"), true);
+    return;
   }
+  fetch(`/api/term/${activa}/input`, {
+    method:"POST", body: JSON.stringify({d: b64de(pegar)})
+  }).catch(()=>{});
+  enfocarSesion();   // el Enter tiene que caer en la sesión, sin click previo
+  aviso(fallaron ? "Subí " + (files.length - fallaron) + " de " + files.length
+                 : "Listo: escribí qué querés y mandá ⏎", !!fallaron);
 });
 
 /* ---- botón de modo del teléfono (shift+tab) -------------------------------
@@ -2523,7 +2570,7 @@ document.addEventListener("paste", async e => {
     ta.dispatchEvent(new Event("input"));
   } else {
     mandar("\x1b[200~" + pegar + "\x1b[201~");
-    abiertas[activa].term.focus();
+    enfocarSesion();
   }
   aviso(fallaron ? "Subí " + (files.length - fallaron) + " de " + files.length :
         "Listo: la ruta quedó en la sesión — escribí qué querés y mandá ⏎", !!fallaron);
