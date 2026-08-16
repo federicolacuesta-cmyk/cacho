@@ -1202,6 +1202,10 @@ PAGINA = r"""<!doctype html>
   --bg:#FAF9F5; --panel:#F0EEE6; --card:#FFFFFF; --borde:#E3E0D5;
   --tinta:#1F1E1B; --gris:#6E6C64; --acento:#2D9CDB; --ocre:#B8860B;
   --term-bg:#1E1D1B;
+  /* letra de display: el nombre "Cacho" y los títulos de sesión. Futura,
+     elegida el 16-ago-2026 sobre otras 11 candidatas (antes era Georgia).
+     Un solo lugar para cambiarla. */
+  --display: Futura, "Century Gothic", system-ui, sans-serif;
 }
 @media (prefers-color-scheme: dark){
   :root{
@@ -1225,7 +1229,7 @@ body{
   display:flex; flex-direction:column; padding:14px 10px 10px;
 }
 #side h1{
-  font-family:Georgia, serif; font-weight:500; font-size:19px;
+  font-family:var(--display); font-weight:500; font-size:19px;
   display:flex; align-items:center; gap:8px; padding:2px 8px 12px;
 }
 #side h1 .logo{color:var(--acento); font-size:17px}
@@ -1299,34 +1303,25 @@ body{
 .item.avisada{background:rgba(184,134,11,.13)}
 .item.avisada .tit{font-weight:700}
 .item .campanita{color:var(--ocre); font-size:11px; flex:none}
-/* ---------- Cacho corriendo ----------
-   Mientras alguna sesión de la app está trabajando, el perro cruza la franja
-   de un lado a otro. Es el "está pensando" de la app, y es él: la foto es la
-   misma que el logo. Dos capas porque son dos movimientos distintos sobre la
-   misma propiedad `transform`: la de afuera cruza, la de adentro trota. */
+/* ---------- Cacho ----------
+   Mientras alguna sesión de la app está trabajando, Cacho se sienta abajo de
+   la lista. Es el dibujo de él, y está SENTADO: respira, nada más. Nada de
+   recortarle la cabeza o las patas para animarlas por separado — la imagen se
+   escala entera y no se deforma nunca. Cuando no hay trabajo, desaparece. */
 #corriendo{
-  display:none; position:relative; height:24px; margin:8px 2px 0;
+  display:none; position:relative; height:46px; margin:8px 2px 0;
   border-top:1px solid var(--borde);
-  /* el cruce anima `left`, que recalcula layout en cada frame: `contain` lo
-     encierra en esta franja para que no arrastre a la lista de al lado */
-  contain:layout style;
+  align-items:flex-end; justify-content:center;
+  contain:layout style;   /* el respirar no toca el layout de la lista */
 }
-#corriendo.ver{display:block}
-#corriendo .patas{position:absolute; top:3px; left:0; animation:cruza 3.6s linear infinite}
+#corriendo.ver{display:flex}
 #corriendo img{
-  display:block; width:20px; height:20px; border-radius:50%;
-  animation:trote .34s ease-in-out infinite alternate;
+  height:42px; display:block; transform-origin:bottom center;
+  animation:respira 3.4s ease-in-out infinite;
 }
-@keyframes cruza{
-  0%   {left:0;    transform:translateX(0)     scaleX(1)}
-  49.9%{left:100%; transform:translateX(-100%) scaleX(1)}
-  50%  {left:100%; transform:translateX(-100%) scaleX(-1)}
-  99.9%{left:0;    transform:translateX(0)     scaleX(-1)}
-  100% {left:0;    transform:translateX(0)     scaleX(1)}
-}
-@keyframes trote{
-  from{transform:translateY(0) rotate(-5deg)}
-  to  {transform:translateY(-3px) rotate(5deg)}
+@keyframes respira{
+  0%,100%{transform:scale(1)}
+  50%    {transform:scale(1.035)}
 }
 #pie{color:var(--gris); font-size:10.5px; padding:10px 8px 2px}
 #btn-avisos{
@@ -1382,7 +1377,7 @@ body{
 #vacio{
   position:absolute; inset:0; display:flex; flex-direction:column; gap:10px;
   align-items:center; justify-content:center; color:var(--gris);
-  font-family:Georgia, serif; font-size:17px;
+  font-family:var(--display); font-size:17px;
 }
 /* ---------- visor de solo-lectura (automáticas / terminadas) ---------- */
 .ver-box{
@@ -1394,7 +1389,7 @@ body{
   flex:none; display:flex; align-items:center; gap:10px;
   padding:12px 16px; border-bottom:1px solid var(--borde); background:var(--panel);
 }
-.ver-head .vtit{font-family:Georgia, serif; font-size:15px; font-weight:500; flex:1;
+.ver-head .vtit{font-family:var(--display); font-size:15px; font-weight:500; flex:1;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 .ver-head .vsub{color:var(--gris); font-size:11px; flex:none}
 #btn-retomar{flex:none; border:1px solid var(--borde); background:var(--card);
@@ -1434,7 +1429,7 @@ body{
   #btn-mic, #btn-enviar-esc{transition:none}
   /* con "reducir movimiento" prendido en macOS, Cacho se queda quieto en un
      costado en vez de correr (sigue indicando que hay trabajo, sin moverse) */
-  #corriendo .patas, #corriendo img, #barra-m .logo-foto{animation:none}
+  #corriendo img, #barra-m .logo-foto{animation:none}
 }
 #btn-mic{right:64px; border:1px solid var(--borde); background:var(--card); color:var(--gris)}
 #btn-enviar-esc{right:22px; border:none; background:var(--acento); color:#fff}
@@ -1472,10 +1467,10 @@ body{
   }
   #barra-m .logo-foto{width:26px; height:26px}
   /* en el celular la barra lateral es un cajón cerrado: el que avisa que hay
-     trabajo es el logo de arriba, trotando en el lugar */
-  body.hay-trabajo #barra-m .logo-foto{animation:trote .34s ease-in-out infinite alternate}
+     trabajo es la cara de Cacho de arriba, respirando */
+  body.hay-trabajo #barra-m .logo-foto{animation:respira 3.4s ease-in-out infinite}
   #barra-m .tit-m{
-    flex:1; font-family:Georgia, serif; font-size:17px; font-weight:500;
+    flex:1; font-family:var(--display); font-size:17px; font-weight:500;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
   }
   #side{
@@ -1581,7 +1576,7 @@ body{
   <button id="btn-nueva">＋ Nueva sesión</button>
   <div id="menu-proy"></div>
   <div id="listas"></div>
-  <div id="corriendo"><span class="patas"><img src="/static/cacho.png" alt=""></span></div>
+  <div id="corriendo"><img src="/static/cacho-dibujo.png" alt="Cacho"></div>
   <button id="btn-avisos">🔔 Avisarme cuando una sesión termine</button>
   <div id="pie">cargando…</div>
 </div>
