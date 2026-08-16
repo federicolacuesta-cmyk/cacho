@@ -177,6 +177,16 @@ def _leer_sesion(path):
             continue
         if d.get("type") == "ai-title" and d.get("aiTitle") and not s["titulo"]:
             s["titulo"] = d["aiTitle"]
+        # El cwd puede NO estar en el head: los transcripts largos arrancan con una
+        # línea `file-history-snapshot` de varios MB y el primer "cwd" cae fuera de
+        # los 256 KB de cabeza (visto 16-ago-2026 en uno de 5,5 MB: el primer cwd
+        # estaba en el byte 3.376.892). Sin cwd, ⟳ Retomar contestaba "la carpeta de
+        # esa sesión ya no existe" con la carpeta ahí, y la sesión no podía
+        # emparejarse con su proceso vivo. La cola sí lo trae, en cada mensaje.
+        if d.get("cwd") and not s["cwd"]:
+            s["cwd"] = d["cwd"]
+        if d.get("gitBranch") and not s["branch"]:
+            s["branch"] = d["gitBranch"]
         if s["ultimo_quien"]:
             continue
         if d.get("type") in ("user", "assistant") and not d.get("isMeta") and not d.get("isSidechain"):
@@ -426,10 +436,10 @@ class TermSession:
         # está ahí, decirlo en pantalla en vez de dejar la pestaña negra.
         # resume_id ya viene validado ([0-9a-f-]): seguro para la línea de comando
         claude = ("claude --resume " + self.resume_id) if self.resume_id else "claude"
-        # El modelo lo decide `tools/vigia_fable.py`: escribe ~/.cacho_modelo con Fable 5
-        # cuando el cupo semanal está vivo y con Opus 5 cuando se agota. Sin archivo, el
-        # comportamiento es el de siempre (el default de la máquina). Se valida el
-        # contenido porque va a una línea de comando.
+        # Si existe ~/.cacho_modelo, las pestañas nuevas arrancan con ese modelo. Sirve
+        # para que un vigía externo cambie de modelo solo (p. ej. bajar a uno más barato
+        # cuando se agota el cupo del más caro, y volver cuando se renueva) sin tocar el
+        # server. Sin archivo, el comportamiento es el de siempre: el default de la máquina.
         modelo = _modelo_preferido()
         if modelo:
             # entre comillas SIEMPRE: el sufijo de contexto va entre corchetes
@@ -1053,6 +1063,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not s:
                     return self._json({"error": "no encontré esa sesión"}, 404)
                 cwd = s["cwd"]
+                if not cwd:
+                    # honesto: no es que la carpeta falte, es que el transcript no
+                    # nos dijo cuál era (ver el rescate del cwd en _leer_sesion)
+                    return self._json(
+                        {"error": "el transcript no dice en qué carpeta corría"}, 400)
                 if not os.path.isdir(cwd):
                     return self._json(
                         {"error": "la carpeta de esa sesión ya no existe"}, 400)
@@ -1284,6 +1299,35 @@ body{
 .item.avisada{background:rgba(184,134,11,.13)}
 .item.avisada .tit{font-weight:700}
 .item .campanita{color:var(--ocre); font-size:11px; flex:none}
+/* ---------- Cacho corriendo ----------
+   Mientras alguna sesión de la app está trabajando, el perro cruza la franja
+   de un lado a otro. Es el "está pensando" de la app, y es él: la foto es la
+   misma que el logo. Dos capas porque son dos movimientos distintos sobre la
+   misma propiedad `transform`: la de afuera cruza, la de adentro trota. */
+#corriendo{
+  display:none; position:relative; height:24px; margin:8px 2px 0;
+  border-top:1px solid var(--borde);
+  /* el cruce anima `left`, que recalcula layout en cada frame: `contain` lo
+     encierra en esta franja para que no arrastre a la lista de al lado */
+  contain:layout style;
+}
+#corriendo.ver{display:block}
+#corriendo .patas{position:absolute; top:3px; left:0; animation:cruza 3.6s linear infinite}
+#corriendo img{
+  display:block; width:20px; height:20px; border-radius:50%;
+  animation:trote .34s ease-in-out infinite alternate;
+}
+@keyframes cruza{
+  0%   {left:0;    transform:translateX(0)     scaleX(1)}
+  49.9%{left:100%; transform:translateX(-100%) scaleX(1)}
+  50%  {left:100%; transform:translateX(-100%) scaleX(-1)}
+  99.9%{left:0;    transform:translateX(0)     scaleX(-1)}
+  100% {left:0;    transform:translateX(0)     scaleX(1)}
+}
+@keyframes trote{
+  from{transform:translateY(0) rotate(-5deg)}
+  to  {transform:translateY(-3px) rotate(5deg)}
+}
 #pie{color:var(--gris); font-size:10.5px; padding:10px 8px 2px}
 #btn-avisos{
   display:none; width:100%; margin-top:6px; background:none; cursor:pointer;
@@ -1307,7 +1351,8 @@ body{
 }
 #paleta input{
   border:0; border-bottom:1px solid var(--borde); background:none; outline:none;
-  color:var(--tinta); font-size:15px; padding:14px 16px; font-family:inherit;
+  color:var(--tinta); padding:14px 16px; font-family:inherit;
+  font-size:16px;   /* 16px o iOS hace auto-zoom al enfocar (igual que #texto-m) */
 }
 #paleta .res{overflow-y:auto; padding:6px}
 #paleta .op{
@@ -1387,6 +1432,9 @@ body{
 }
 @media (prefers-reduced-motion: reduce){
   #btn-mic, #btn-enviar-esc{transition:none}
+  /* con "reducir movimiento" prendido en macOS, Cacho se queda quieto en un
+     costado en vez de correr (sigue indicando que hay trabajo, sin moverse) */
+  #corriendo .patas, #corriendo img, #barra-m .logo-foto{animation:none}
 }
 #btn-mic{right:64px; border:1px solid var(--borde); background:var(--card); color:var(--gris)}
 #btn-enviar-esc{right:22px; border:none; background:var(--acento); color:#fff}
@@ -1423,6 +1471,9 @@ body{
     padding:2px 6px; cursor:pointer;
   }
   #barra-m .logo-foto{width:26px; height:26px}
+  /* en el celular la barra lateral es un cajón cerrado: el que avisa que hay
+     trabajo es el logo de arriba, trotando en el lugar */
+  body.hay-trabajo #barra-m .logo-foto{animation:trote .34s ease-in-out infinite alternate}
   #barra-m .tit-m{
     flex:1; font-family:Georgia, serif; font-size:17px; font-weight:500;
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
@@ -1456,6 +1507,9 @@ body{
     border-top:1px solid var(--borde);
     padding:6px 8px calc(env(safe-area-inset-bottom) + 6px);
   }
+  /* con el teclado abierto sobra poco alto: la paleta arranca más arriba */
+  #paleta{padding-top:6vh}
+  #paleta .caja{max-height:74vh}
   #teclas-m{display:flex; gap:5px; margin-bottom:6px}
   #teclas-m button{
     flex:1; border:1px solid var(--borde); background:var(--card); color:var(--tinta);
@@ -1506,6 +1560,11 @@ body{
 }
 #aviso-m.ver{display:block}
 #aviso-m.error{border-color:#D9534F; color:#D9534F}
+#aviso-m .deshacer{
+  border:0; background:var(--acento); color:#fff; cursor:pointer;
+  border-radius:12px; padding:4px 12px; font-size:12.5px; font-weight:600;
+  font-family:inherit; margin-left:4px;
+}
 </style>
 </head>
 <body>
@@ -1522,6 +1581,7 @@ body{
   <button id="btn-nueva">＋ Nueva sesión</button>
   <div id="menu-proy"></div>
   <div id="listas"></div>
+  <div id="corriendo"><span class="patas"><img src="/static/cacho.png" alt=""></span></div>
   <button id="btn-avisos">🔔 Avisarme cuando una sesión termine</button>
   <div id="pie">cargando…</div>
 </div>
@@ -1600,6 +1660,9 @@ function b64de(str){
 // aviso flotante no bloqueante (nada de alert(): en el teléfono no se ve
 // qué falló y en el escritorio corta el flujo)
 let avisoTimer = null;
+let deshacerTimer = null;   // el del toast "Deshacer" (ver ofrecerDeshacer); se declara
+                            // acá y no allá abajo porque aviso() lo cancela y `let`
+                            // tiene zona muerta: usarlo antes sería ReferenceError
 let ptyAvisado = 0;   // freno: onData dispara por tecla, no repetir el aviso
 function avisoPty(){
   const t = Date.now();
@@ -1611,6 +1674,8 @@ function aviso(txt, error){
   const el = $("#aviso-m");
   if(!el) return;
   clearTimeout(avisoTimer);
+  clearTimeout(deshacerTimer);   // si había un "Deshacer" abierto, este aviso lo reemplaza
+                                 // (y su temporizador ya no debe apagar el nuevo)
   if(!txt){ el.classList.remove("ver"); return; }
   el.textContent = txt;
   el.classList.toggle("error", !!error);
@@ -1808,18 +1873,41 @@ function abrirVer(sid, titulo, viva){
   pintarVer();
 }
 
-async function retomar(){
-  const box = document.querySelector(".ver-box");
-  if(!box || !box.dataset.sid) return;
+async function retomarSid(sid){
+  if(!sid) return;
   try{
-    const r = await fetch("/api/term/new?resume=" + box.dataset.sid, {method:"POST"});
+    const r = await fetch("/api/term/new?resume=" + sid, {method:"POST"});
     const j = await r.json();
     if(!j.id) throw new Error(j.error || "?");
     await refrescar();
     abrirTab(j.id);
   }catch(err){
-    $("#pie").textContent = "no pude retomar: " + err.message;
+    aviso("No pude retomar la charla: " + err.message, true);
   }
+}
+function retomar(){
+  const box = document.querySelector(".ver-box");
+  if(box) retomarSid(box.dataset.sid);
+}
+
+/* Red de seguridad de la ✕ de un click: la pestaña muere, pero la CHARLA no.
+   Durante unos segundos se ofrece reabrirla con `claude --resume`, que es
+   exactamente lo que hace el botón ⟳ del visor. Sin esto, errarle al click
+   en la barra costaba la sesión y no había vuelta atrás. */
+function ofrecerDeshacer(t){
+  const el = $("#aviso-m");
+  if(!el) return;
+  clearTimeout(avisoTimer); clearTimeout(deshacerTimer);
+  el.classList.remove("error");
+  el.innerHTML = "Cerré «" + esc(t.titulo) + "» · " +
+    '<button class="deshacer">Deshacer</button>';
+  el.classList.add("ver");
+  deshacerTimer = setTimeout(() => el.classList.remove("ver"), 9000);
+  el.querySelector(".deshacer").onclick = () => {
+    clearTimeout(deshacerTimer);
+    el.classList.remove("ver");
+    retomarSid(t.sid);
+  };
 }
 
 async function pintarVer(){
@@ -1926,6 +2014,11 @@ function render(){
       term12.map(s => itemHTML(s, attrsDe(s), {activo:esActiva(s), sinSnippet:true})).join("");
   }
   $("#listas").innerHTML = h || '<div class="seccion">Sin sesiones vivas</div>';
+  // Cacho corre mientras haya trabajo adentro de la app (en el teléfono, donde
+  // no se ve la barra, es el logo de arriba el que trota)
+  const hayTrabajo = estado.tabs.some(t => t.estado === "trabajando");
+  $("#corriendo").classList.toggle("ver", hayTrabajo);
+  document.body.classList.toggle("hay-trabajo", hayTrabajo);
   $("#pie").textContent = estado.tabs.length + " en la app · " +
     vivasAfuera.length + " afuera · " + muertas + " terminadas hoy" +
     (MOVIL ? "" : " · ⌘K buscar");
@@ -2008,9 +2101,12 @@ document.addEventListener("click", e => {
   if(x){
     // Un click y chau (16-ago-2026). Antes pedía confirmar con un segundo
     // click, pero la confirmación se vencía sola a los 2,5 s: en la práctica
-    // había que darle tres veces para que cerrara.
+    // había que darle tres veces para que cerrara. La red es el "Deshacer".
     e.stopPropagation();
-    cerrarTab(x.dataset.x, true);
+    const id = x.dataset.x;
+    const t = estado.tabs.find(t => t.id === id);
+    cerrarTab(id, true);
+    if(t && t.sid) ofrecerDeshacer(t);   // sin transcript no hay qué retomar
     return;
   }
   const item = e.target.closest(".item");
@@ -2367,18 +2463,29 @@ document.addEventListener("dragleave", e => {
 // en la sesión (queja de 16-ago-2026). Un solo focus() no alcanza — el
 // navegador termina de digerir el drop DESPUÉS de nuestro handler y lo pisa.
 // Por eso se insiste unas cuantas veces durante medio segundo.
+let focoTimers = [];
 function enfocarSesion(){
   const a = abiertas[activa];
+  // En el teléfono NO se enfoca xterm: su textarea oculto rompe el teclado de
+  // iOS (por eso queda inputmode="none"). Ahí el foco va al cajón de abajo.
+  if(MOVIL){ const ta = $("#texto-m"); if(ta) ta.focus(); return; }
   if(!a) return;
-  [0, 60, 180, 400].forEach(ms => setTimeout(() => {
+  focoTimers.forEach(clearTimeout);
+  focoTimers = [0, 60, 180, 400].map(ms => setTimeout(() => {
     try{ window.focus(); a.term.focus(); }catch(e){}
   }, ms));
 }
+// Si en medio de la insistencia tocás otra cosa (la barra, un botón), mandás
+// vos: se cortan los reintentos para no robarte el foco de vuelta.
+document.addEventListener("pointerdown", () => {
+  focoTimers.forEach(clearTimeout); focoTimers = [];
+}, true);
 
 document.addEventListener("drop", async e => {
   e.preventDefault();  // sin esto Chrome navega al archivo y "te lo tira afuera"
   $("#terms").classList.remove("arrastrando");
   if(!activa || !abiertas[activa]){ aviso("Abrí una sesión antes de soltar el archivo", true); return; }
+  enfocarSesion();   // ya mismo: subir un video puede tardar y el foco no espera
   const files = [...(e.dataTransfer.files || [])];
   let pegar = "", fallaron = 0;
   if(files.length){
@@ -2501,8 +2608,11 @@ function limpiarAviso(clave){
 }
 
 function revisarAvisos(){
-  const lista = estado.tabs.map(t => Object.assign({__tab:true}, t))
-    .concat(estado.afuera.filter(s => s.viva && s.tipo === "terminal"));
+  // SOLO las pestañas de la app. Las sesiones de Terminal de afuera terminan
+  // decenas de veces por día mientras trabajás sentado frente a ellas, y Cacho
+  // no tiene forma de saber si las estás mirando: avisarlas era garantía de
+  // sonar todo el día al pedo. Lo de adentro sí lo controla la app.
+  const lista = estado.tabs.map(t => Object.assign({__tab:true}, t));
   const vistos = {};
   for(const o of lista){
     const k = claveDe(o);
@@ -2526,6 +2636,7 @@ function pintarBotonAvisos(){
 }
 $("#btn-avisos").addEventListener("click", () => {
   beep();   // el click también destraba el audio del navegador
+  if(!("Notification" in window)){ aviso("Este navegador no tiene notificaciones", true); return; }
   Notification.requestPermission().then(p => {
     pintarBotonAvisos();
     aviso(p === "granted" ? "Listo: te aviso cuando una sesión termine"
@@ -2585,8 +2696,12 @@ let paletaOpts = [], paletaSel = 0;
 function opcionesPaleta(q){
   const norm = s => String(s || "").toLowerCase()
     .normalize("NFD").replace(/[\u0300-\u036f]/g, "");   // "meta ads" encuentra "Metá"
-  const t = norm(q).trim();
-  const casa = o => !t || norm(o.titulo + " " + o.proyecto + " " + (o.ultimo_txt||"")).includes(t);
+  // Por PALABRAS, no por substring: si el proyecto arranca con un emoji o
+  // tiene algo en el medio, buscar la frase seguida no encuentra nada. Con
+  // palabras sueltas, el orden y lo que haya entremedio dejan de importar.
+  const palabras = norm(q).trim().split(/\s+/).filter(Boolean);
+  const casaCon = txt => { const s = norm(txt); return palabras.every(w => s.includes(w)); };
+  const casa = o => casaCon(o.titulo + " " + o.proyecto + " " + (o.ultimo_txt||""));
   const out = [];
   estado.tabs.map(x => Object.assign({__tab:true}, x)).filter(casa).forEach(o =>
     out.push({icono:"●", qué:o.titulo, dónde:o.proyecto, estado:o.estado,
@@ -2596,14 +2711,19 @@ function opcionesPaleta(q){
               dónde: o.proyecto + (o.tipo === "terminal" ? " · Terminal" : " · automática"),
               estado:o.estado,
               hacer:() => o.tipo === "terminal" && o.tty
-                ? fetch("/api/abrir?tty=" + o.tty, {method:"POST"}).catch(()=>{})
+                ? fetch("/api/abrir?tty=" + o.tty, {method:"POST"})
+                    .then(r => r.json())
+                    .then(j => { if(j && !j.ok) aviso(j.msg || "No pude abrir esa Terminal", true); })
+                    .catch(() => aviso("No pude abrir esa Terminal", true))
                 : abrirVer(o.id, o.titulo, o.viva)}));
   estado.afuera.filter(s => !s.viva).filter(casa).slice(0, 8).forEach(o =>
     out.push({icono:"◌", qué:o.titulo, dónde:o.proyecto + " · terminada",
               estado:"terminada", hacer:() => abrirVer(o.id, o.titulo, false)}));
-  estado.proyectos.filter(p => !t || norm(p.nombre).includes(t)).forEach(p =>
-    out.push({icono:"＋", qué:"Nueva sesión en " + p.nombre, dónde:"", estado:"",
-              hacer:() => nueva(p.cwd)}));
+  // se matchea contra la frase entera para que escribir "nueva" (o "sesión en
+  // manage") también llegue acá, no solo tipear el nombre pelado del proyecto
+  estado.proyectos.filter(p => casaCon("nueva sesión en " + p.nombre))
+    .forEach(p => out.push({icono:"＋", qué:"Nueva sesión en " + p.nombre,
+                            dónde:"", estado:"", hacer:() => nueva(p.cwd)}));
   return out.slice(0, 40);
 }
 
@@ -2636,7 +2756,9 @@ $("#paleta-q").addEventListener("input", e => {
   paletaOpts = opcionesPaleta(e.target.value); paletaSel = 0; pintarPaleta();
 });
 $("#paleta-q").addEventListener("keydown", e => {
-  if(e.key === "ArrowDown"){ e.preventDefault(); paletaSel = Math.min(paletaSel+1, paletaOpts.length-1); pintarPaleta(); }
+  // el max(0, …) NO sobra: con la lista vacía, length-1 es -1 y el índice se
+  // iba a negativo (paletaOpts[-1] = undefined)
+  if(e.key === "ArrowDown"){ e.preventDefault(); paletaSel = Math.max(0, Math.min(paletaSel+1, paletaOpts.length-1)); pintarPaleta(); }
   else if(e.key === "ArrowUp"){ e.preventDefault(); paletaSel = Math.max(paletaSel-1, 0); pintarPaleta(); }
   else if(e.key === "Enter"){ e.preventDefault(); const o = paletaOpts[paletaSel]; if(o){ cerrarPaleta(); o.hacer(); } }
   else if(e.key === "Escape"){ e.preventDefault(); cerrarPaleta(); }
@@ -2663,6 +2785,7 @@ async function refrescar(){
     estado = j;
     revisarAvisos();          // antes de render(): el 🔔 se pinta en la lista
     render();
+    pintarBotonAvisos();      // el permiso pudo darse desde el candado del navegador
     if(MOVIL) pintarModo();   // por si cambiaste el modo desde otro lado
     if($("#paleta").classList.contains("ver")){
       paletaOpts = opcionesPaleta($("#paleta-q").value);
