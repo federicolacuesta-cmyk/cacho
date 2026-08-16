@@ -609,16 +609,24 @@ def estado_general():
     tabs_json = []
     for t in sorted(tabs, key=lambda x: x.creado):
         p = next((x for x in parseadas if x["id"] == t.transcript_id), None)
+        quieto = ahora - t.last_out
         if not t.viva:
             estado = "terminada"
         elif p:
-            estado = "trabajando" if (ahora - p["mtime"]) < 60 else "esperando"
+            # Dos señales, y se piden LAS DOS para decir "trabajando": el
+            # transcript (que tarda hasta un minuto en enfriarse) y el pty. La
+            # TUI redibuja su spinner mientras piensa, así que pty quieto ≥8 s
+            # = terminó o está pidiendo permiso. Sin esto el aviso de "te
+            # espera" llegaba hasta un minuto tarde (o nunca, si la TUI quedó
+            # frenada en una pregunta con el transcript recién escrito).
+            estado = ("trabajando"
+                      if (ahora - p["mtime"]) < 60 and quieto < 8 else "esperando")
         else:
-            estado = "trabajando" if (ahora - t.last_out) < 6 else "esperando"
+            estado = "trabajando" if quieto < 6 else "esperando"
         tabs_json.append(_aplicar_meta({
             "id": t.id, "cwd": t.cwd, "proyecto": _proyecto_lindo(t.cwd),
             "titulo": t.titulo or "Nueva sesión", "estado": estado,
-            "viva": t.viva,
+            "viva": t.viva, "quieto_seg": int(quieto),
             "hace_seg": int(ahora - (p["mtime"] if p else t.last_out)),
             "ultimo_quien": p["ultimo_quien"] if p else "",
             "ultimo_txt": p["ultimo_txt"] if p else "",
@@ -1228,7 +1236,6 @@ body{
   font-size:12px; padding:0 3px; border-radius:4px; flex:none;
 }
 .item .x:hover{opacity:1; color:var(--tinta)}
-.item .x.confirmar{color:#fff; background:var(--acento); opacity:1}
 /* Fijar arriba / renombrar: aparecen al pasar por encima para no ensuciar la lista.
    En el celular no hay hover, así que ahí van siempre visibles (media query abajo). */
 .item .acc{
@@ -1243,7 +1250,49 @@ body{
 .item.fijada[draggable="true"]{cursor:grab}
 .item.arrastrando{opacity:.45; cursor:grabbing}
 .item .tit.propio{font-style:normal}
+/* Sesión que terminó y te está esperando sin que la hayas mirado: se marca
+   hasta que la abrís (ver `esperan` en el JS). El punto ocre solo dice
+   "quieta"; esto dice "quieta Y recién terminada, andá". */
+.item.avisada{background:rgba(184,134,11,.13)}
+.item.avisada .tit{font-weight:700}
+.item .campanita{color:var(--ocre); font-size:11px; flex:none}
 #pie{color:var(--gris); font-size:10.5px; padding:10px 8px 2px}
+#btn-avisos{
+  display:none; width:100%; margin-top:6px; background:none; cursor:pointer;
+  border:1px dashed var(--borde); border-radius:10px; padding:7px 10px;
+  color:var(--gris); font-size:11px; text-align:left;
+}
+#btn-avisos.ver{display:block}
+#btn-avisos:hover{color:var(--tinta); border-color:var(--acento)}
+/* ---------- paleta de búsqueda (⌘K) ---------- */
+#paleta{
+  display:none; position:fixed; inset:0; z-index:200;
+  background:rgba(0,0,0,.45); padding-top:12vh; justify-content:center;
+}
+#paleta.ver{display:flex}
+#paleta .caja{
+  --panel:#1F1E1C; --card:#30302E; --borde:#3B3A36;
+  --tinta:#F5F4EF; --gris:#A8A69D; --acento:#4FB3E8;
+  width:min(560px, 92vw); max-height:66vh; display:flex; flex-direction:column;
+  background:var(--panel); color:var(--tinta); border:1px solid var(--borde);
+  border-radius:14px; overflow:hidden; box-shadow:0 24px 60px rgba(0,0,0,.5);
+}
+#paleta input{
+  border:0; border-bottom:1px solid var(--borde); background:none; outline:none;
+  color:var(--tinta); font-size:15px; padding:14px 16px; font-family:inherit;
+}
+#paleta .res{overflow-y:auto; padding:6px}
+#paleta .op{
+  display:flex; align-items:center; gap:9px; padding:8px 10px;
+  border-radius:9px; cursor:pointer; font-size:13px;
+}
+#paleta .op.sel{background:var(--card)}
+#paleta .op .qué{flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+#paleta .op .dónde{color:var(--gris); font-size:10.5px; flex:none}
+#paleta .vacio{color:var(--gris); font-size:12.5px; padding:14px 12px}
+#paleta .pieP{
+  color:var(--gris); font-size:10.5px; padding:8px 14px; border-top:1px solid var(--borde);
+}
 /* ---------- zona principal ---------- */
 #main{flex:1; display:flex; flex-direction:column; min-width:0}
 #terms{flex:1; position:relative; padding:14px; min-height:0}
@@ -1379,12 +1428,18 @@ body{
     border-top:1px solid var(--borde);
     padding:6px 8px calc(env(safe-area-inset-bottom) + 6px);
   }
-  #teclas-m{display:flex; gap:6px; margin-bottom:6px}
+  #teclas-m{display:flex; gap:5px; margin-bottom:6px}
   #teclas-m button{
     flex:1; border:1px solid var(--borde); background:var(--card); color:var(--tinta);
-    border-radius:8px; padding:6px 0; font-size:13px; font-family:Menlo, monospace;
+    border-radius:8px; padding:6px 0; font-size:12px; font-family:Menlo, monospace;
+    min-width:0; white-space:nowrap;
   }
   #teclas-m button:active{background:var(--borde)}
+  /* El de modo no compite por ancho con las teclas sueltas: lleva texto (el modo
+     en el que está la sesión, leído de la pantalla de la TUI) y se ancha solo. */
+  #teclas-m #btn-modo{flex:none; padding:6px 9px}
+  #teclas-m #btn-modo.plan{border-color:var(--acento); color:var(--acento); font-weight:700}
+  #teclas-m #btn-modo.ojo{border-color:var(--ocre); color:var(--ocre); font-weight:700}
   #fila-envio{display:flex; gap:8px; align-items:flex-end}
   #texto-m{
     flex:1; resize:none; border:1px solid var(--borde); border-radius:18px;
@@ -1430,6 +1485,7 @@ body{
   <button id="btn-menu" title="Sesiones">☰</button>
   <img class="logo-foto" src="/static/cacho.png" alt="">
   <span class="tit-m" id="tit-m">Cacho</span>
+  <button id="btn-buscar" title="Buscar sesión">🔍</button>
 </div>
 <div id="velo"></div>
 <div id="aviso-m"></div>
@@ -1438,7 +1494,16 @@ body{
   <button id="btn-nueva">＋ Nueva sesión</button>
   <div id="menu-proy"></div>
   <div id="listas"></div>
+  <button id="btn-avisos">🔔 Avisarme cuando una sesión termine</button>
   <div id="pie">cargando…</div>
+</div>
+<div id="paleta">
+  <div class="caja">
+    <input id="paleta-q" placeholder="Buscar sesión o proyecto…" autocomplete="off"
+           autocorrect="off" spellcheck="false">
+    <div class="res" id="paleta-res"></div>
+    <div class="pieP">↑↓ moverse · ⏎ abrir · esc cerrar</div>
+  </div>
 </div>
 <div id="main">
   <div id="terms">
@@ -1449,12 +1514,16 @@ body{
   </div>
   <div id="input-m">
     <div id="teclas-m">
+      <button id="btn-modo" data-seq="&#27;[Z"
+              title="Cambiar modo (shift+tab): normal → auto-aceptar → plan">⇧⇥ modo</button>
       <button data-seq="&#27;">esc</button>
       <button data-seq="&#9;">tab</button>
       <button data-seq="&#27;[A">↑</button>
       <button data-seq="&#27;[B">↓</button>
       <button data-seq="&#3;">^C</button>
       <button data-seq="&#13;">⏎</button>
+      <button data-seq="&#27;" data-repetir="1"
+              title="Editar el mensaje anterior (esc esc)">✎</button>
     </div>
     <div id="fila-envio">
       <button id="btn-adj" title="Adjuntar foto o archivo">＋</button>
@@ -1474,7 +1543,11 @@ function menu(abrir){ document.body.classList.toggle("menu-abierto", abrir); }
 let estado = {tabs:[], afuera:[], proyectos:[]};
 let abiertas = {};        // id -> {term, fit, es, box}
 let activa = null;
-let confirmarX = null;
+
+// Sesiones que terminaron y todavía no miraste (ver "avisos" más abajo). Se
+// declaran acá arriba porque itemHTML() las lee para marcar el ítem.
+const esperan = new Set();
+function claveDe(o){ return (o.__tab ? "tab:" : "ses:") + o.id; }
 
 // escapa TAMBIÉN comillas: esc() se usa dentro de atributos (data-vtit,
 // data-cwd…) y un título con " rompía el HTML de la barra lateral entera
@@ -1629,6 +1702,7 @@ function desconectar(id){
 
 function activar(id){
   activa = id;
+  if(id) limpiarAviso("tab:" + id);   // la miraste: se apaga el 🔔 y baja el contador
   // una sola conexión de stream viva (ver conectar()): se corta la de las
   // demás pestañas y se (re)conecta la activa — escritorio Y teléfono
   Object.keys(abiertas).forEach(k => { if(k !== id) desconectar(k); });
@@ -1646,6 +1720,7 @@ function activar(id){
       fetch(`/api/term/${id}/resize`, {method:"POST",
         body: JSON.stringify({cols: a.term.cols, rows: a.term.rows})}).catch(()=>{});
       ubicarBotones();
+      if(MOVIL) setTimeout(pintarModo, 300);   // el buffer se llena al reconectar
     });
   }
   render();
@@ -1681,6 +1756,7 @@ async function nueva(cwd){
 let verTitulo = "";   // título de la sesión que se está viendo (para la barra móvil)
 
 function abrirVer(sid, titulo, viva){
+  limpiarAviso("ses:" + sid);
   // una sola caja de visor: al abrir otra sesión se reutiliza
   let box = document.querySelector(".ver-box");
   if(!box){
@@ -1755,11 +1831,13 @@ function itemHTML(o, attrs, opts){
         title="${o.fija?"Soltar de arriba":"Fijar arriba"}">${o.fija?"📌":"📍"}</button>
       <button class="acc" data-renombrar="${esc(sid)}" data-nombre="${esc(o.titulo)}"
         title="Ponerle un nombre">✏️</button>` : "";
+  const espera = esperan.has(claveDe(o));
   return `
-      <div class="item ${opts.activo?"activo":""} ${opts.fijada?"fijada":""}" ${attrs}
+      <div class="item ${opts.activo?"activo":""} ${opts.fijada?"fijada":""} ${espera?"avisada":""}" ${attrs}
            data-sid="${esc(sid)}" ${opts.fijada?'draggable="true"':""}>
         <div class="fila"><span class="dot ${o.estado}"></span>
           <span class="tit ${o.renombrada?"propio":""}">${esc(o.titulo)}</span>
+          ${espera?'<span class="campanita" title="terminó y te espera">🔔</span>':""}
           <span style="color:var(--gris);font-size:10px">${hace(o.hace_seg)}</span>
           ${acciones}${opts.botonX||""}</div>
         <div class="sub">${esc(o.proyecto)}</div>
@@ -1782,8 +1860,8 @@ function render(){
   const autos = vivasAfuera.filter(s => s.tipo !== "terminal");
   const muertas = estado.afuera.filter(s => !s.viva).length;
   const esActiva = o => o.__tab ? o.id===activa : ("ver:"+o.id)===activa;
-  const botonX = t => `<button class="x ${confirmarX===t.id?"confirmar":""}" data-x="${t.id}"
-            title="${confirmarX===t.id?"Click de nuevo: mata la sesión":"Cerrar"}">✕</button>`;
+  const botonX = t => `<button class="x" data-x="${t.id}"
+            title="Cerrar esta sesión">✕</button>`;
   let h = "";
 
   // ── FIJADAS: salen de su sección y suben al tope, en el orden que las dejaste ──
@@ -1791,8 +1869,10 @@ function render(){
   fijadas.sort((a,b) => (a.orden==null?9999:a.orden) - (b.orden==null?9999:b.orden));
   const fijos = new Set(fijadas.map(o => o.sid));
   if(fijadas.length){
+    // con snippet: las fijadas son justamente las que mirás de reojo para
+    // saber en qué anda cada una sin tener que abrirlas
     h += '<div class="seccion">📌 Fijadas</div>' + fijadas.map(o =>
-      itemHTML(o, attrsDe(o), {activo:esActiva(o), fijada:true, sinSnippet:true,
+      itemHTML(o, attrsDe(o), {activo:esActiva(o), fijada:true,
                                botonX: o.__tab ? botonX(o) : ""})).join("");
   }
   const libres = a => a.filter(o => !fijos.has(o.sid));
@@ -1819,7 +1899,8 @@ function render(){
   }
   $("#listas").innerHTML = h || '<div class="seccion">Sin sesiones vivas</div>';
   $("#pie").textContent = estado.tabs.length + " en la app · " +
-    vivasAfuera.length + " afuera · " + muertas + " terminadas hoy";
+    vivasAfuera.length + " afuera · " + muertas + " terminadas hoy" +
+    (MOVIL ? "" : " · ⌘K buscar");
   if(MOVIL){
     const t = estado.tabs.find(t => t.id === activa);
     $("#tit-m").textContent = t ? t.titulo :
@@ -1875,6 +1956,7 @@ document.addEventListener("dragend", async () => {
 
 /* ---------------- eventos ---------------- */
 document.addEventListener("click", e => {
+  if(e.target.closest("#btn-buscar")){ menu(false); abrirPaleta(); return; }
   if(e.target.closest("#btn-menu")){
     menu(!document.body.classList.contains("menu-abierto"));
     return;
@@ -1896,21 +1978,18 @@ document.addEventListener("click", e => {
   }
   const x = e.target.closest(".x");
   if(x){
+    // Un click y chau (16-ago-2026). Antes pedía confirmar con un segundo
+    // click, pero la confirmación se vencía sola a los 2,5 s: en la práctica
+    // había que darle tres veces para que cerrara.
     e.stopPropagation();
-    const id = x.dataset.x;
-    if(confirmarX === id){
-      confirmarX = null;
-      cerrarTab(id, true);
-    } else {
-      confirmarX = id; render();
-      setTimeout(() => { if(confirmarX === id){ confirmarX = null; render(); } }, 2500);
-    }
+    cerrarTab(x.dataset.x, true);
     return;
   }
   const item = e.target.closest(".item");
   if(item){
     if(item.dataset.tab){ abrirTab(item.dataset.tab); return; }
     if(item.dataset.tty){
+      if(item.dataset.sid) limpiarAviso("ses:" + item.dataset.sid);
       fetch("/api/abrir?tty=" + item.dataset.tty, {method:"POST"})
         .then(r => r.json()).then(j => { if(j && !j.ok) aviso(j.msg || "No pude abrir esa Terminal", true); })
         .catch(() => aviso("No pude abrir esa Terminal", true));
@@ -1985,7 +2064,13 @@ if(MOVIL){
   });
   document.querySelectorAll("#teclas-m button").forEach(b =>
     b.addEventListener("pointerdown", e => {
-      e.preventDefault(); mandar(b.dataset.seq);
+      e.preventDefault();
+      mandar(b.dataset.seq);
+      // esc×2 (editar el mensaje anterior): la TUI espera DOS escapes
+      // SEPARADOS; pegados los lee como una secuencia sola y no hace nada.
+      if(b.dataset.repetir) setTimeout(() => mandar(b.dataset.seq), 90);
+      // el modo cambia recién cuando la TUI repinta su pie
+      if(b.id === "btn-modo") setTimeout(pintarModo, 400);
     }));
   // ＋ adjuntar desde el teléfono: mismo circuito que el drag&drop del
   // escritorio (/api/subir guarda en ~/Library/Caches/Cacho/subidas y acá
@@ -2275,6 +2360,253 @@ document.addEventListener("drop", async e => {
   }
 });
 
+/* ---- botón de modo del teléfono (shift+tab) -------------------------------
+   Shift+Tab cicla los modos de Claude Code (normal → auto-aceptar → plan…),
+   pero en el teclado de iOS no existe: en el celular no había forma de entrar
+   en modo plan. El botón manda ⇧⇥ de verdad (ESC [ Z, lo que manda una
+   terminal) y además MUESTRA en qué modo está la sesión, leyéndolo del pie
+   que la propia TUI pinta ("plan mode on (shift+tab to cycle)"). Se lee de la
+   pantalla y no de un estado propio: la fuente es lo que Claude muestra, así
+   no se desincroniza si cambiás el modo desde el escritorio. */
+function modoActual(){
+  const a = abiertas[activa];
+  if(!a || !a.term) return "";
+  const buf = a.term.buffer.active;
+  let txt = "";
+  for(let f = a.term.rows - 1; f >= Math.max(0, a.term.rows - 8); f--){
+    const l = buf.getLine(buf.viewportY + f);
+    if(l) txt += l.translateToString(true).toLowerCase() + "\n";
+  }
+  // Se busca el NOMBRE del modo, no el "(shift+tab to cycle)" del final: en la
+  // pantalla angosta del teléfono la TUI corta esa línea ("…(shift+tab to  ·").
+  // Los cinco de Claude Code v2.1 (verificado ciclando con ⇧⇥ el 16-ago-2026):
+  //   ⏵⏵ accept edits on → ⏸ plan mode on → ⏵⏵ bypass permissions on
+  //   → ⏵⏵ auto mode on → ⏸ manual mode on → vuelve a empezar
+  if(txt.includes("accept edits on")) return "edits";
+  if(txt.includes("plan mode on")) return "plan";
+  if(txt.includes("bypass permissions on")) return "bypass";
+  if(txt.includes("auto mode on")) return "auto";
+  if(txt.includes("manual mode on")) return "manual";
+  return "";   // TUI sin línea de modo (o sin TUI): el botón queda neutro
+}
+function pintarModo(){
+  const b = $("#btn-modo");
+  if(!b) return;
+  const m = modoActual();
+  b.textContent = "⇧⇥ " + (m || "modo");
+  b.classList.toggle("plan", m === "plan");
+  // bypass y auto ejecutan SIN preguntarte: que se vean distinto, de un vistazo
+  b.classList.toggle("ojo", m === "bypass" || m === "auto");
+}
+
+/* ---- avisos: que Cacho golpee la puerta cuando una sesión termina ----------
+   Con tres o cuatro sesiones andando, el problema no es que Claude tarde: es
+   que termina y nadie se entera. El punto de color ya decía "quieta", pero
+   había que estar mirando la barra. Acá se detecta la TRANSICIÓN
+   trabajando→esperando (el server la calcula rápido: pty quieto ≥8 s, ver
+   estado_general) y se avisa: notificación del sistema + sonidito + contador
+   en el título de la pestaña + 🔔 en el ítem hasta que lo abrís.
+   No avisan las automáticas: corren solas y no esperan nada de nadie. */
+let estadoPrev = {};          // clave -> último estado visto
+let audioCtx = null, ultimoBeep = 0;
+
+function beep(){
+  const t = Date.now();
+  if(t - ultimoBeep < 1500) return;   // 3 sesiones que terminan juntas: un solo bip
+  ultimoBeep = t;
+  try{
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if(!AC) return;
+    audioCtx = audioCtx || new AC();
+    if(audioCtx.state === "suspended") audioCtx.resume();
+    const t0 = audioCtx.currentTime;
+    [880, 1320].forEach((f, i) => {   // dos notas cortas, sin archivo de audio
+      const osc = audioCtx.createOscillator(), g = audioCtx.createGain();
+      const ini = t0 + i * 0.13;
+      osc.type = "sine"; osc.frequency.value = f;
+      g.gain.setValueAtTime(0.0001, ini);
+      g.gain.exponentialRampToValueAtTime(0.13, ini + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, ini + 0.12);
+      osc.connect(g); g.connect(audioCtx.destination);
+      osc.start(ini); osc.stop(ini + 0.14);
+    });
+  }catch(e){}
+}
+
+function notificar(o){
+  beep();
+  if(navigator.vibrate) try{ navigator.vibrate([40, 60, 40]); }catch(e){}
+  if(!("Notification" in window) || Notification.permission !== "granted") return;
+  try{
+    const n = new Notification(o.titulo || "Sesión", {
+      body: (o.proyecto || "") + " — terminó, te espera",
+      icon: "/static/cacho.png", tag: claveDe(o),
+    });
+    n.onclick = () => { window.focus(); if(o.__tab) abrirTab(o.id); n.close(); };
+  }catch(e){}
+}
+
+function pintarTitulo(){
+  document.title = esperan.size ? "(" + esperan.size + ") Cacho" : "Cacho";
+}
+function limpiarAviso(clave){
+  if(esperan.delete(clave)) pintarTitulo();
+}
+
+function revisarAvisos(){
+  const lista = estado.tabs.map(t => Object.assign({__tab:true}, t))
+    .concat(estado.afuera.filter(s => s.viva && s.tipo === "terminal"));
+  const vistos = {};
+  for(const o of lista){
+    const k = claveDe(o);
+    vistos[k] = o.estado;
+    if(o.estado === "trabajando"){
+      esperan.delete(k);   // arrancó de nuevo (le contestaste por otro lado)
+    } else if(estadoPrev[k] === "trabajando" && o.estado === "esperando"){
+      // si la estás mirando de frente no hace falta molestar
+      const mirando = document.hasFocus() && o.__tab && activa === o.id;
+      if(!mirando){ esperan.add(k); notificar(o); }
+    }
+  }
+  for(const k of [...esperan]) if(!(k in vistos)) esperan.delete(k);
+  estadoPrev = vistos;
+  pintarTitulo();
+}
+
+function pintarBotonAvisos(){
+  const hay = ("Notification" in window);
+  $("#btn-avisos").classList.toggle("ver", hay && Notification.permission === "default");
+}
+$("#btn-avisos").addEventListener("click", () => {
+  beep();   // el click también destraba el audio del navegador
+  Notification.requestPermission().then(p => {
+    pintarBotonAvisos();
+    aviso(p === "granted" ? "Listo: te aviso cuando una sesión termine"
+                          : "El navegador no dio permiso de notificaciones", p !== "granted");
+  });
+});
+pintarBotonAvisos();
+
+/* ---- pegar del portapapeles (⌘V): captura → archivo → ruta en la sesión ----
+   Cmd+Shift+4 y pegar es el camino corto para mostrarle algo a Claude. Antes
+   había que guardar la captura y arrastrarla. Mismo circuito que el drag&drop
+   (/api/subir), pero el portapapeles no trae nombre: se lo inventamos. */
+document.addEventListener("paste", async e => {
+  if($("#paleta").classList.contains("ver")) return;   // en la paleta, pegar es pegar
+  const items = [...((e.clipboardData && e.clipboardData.items) || [])];
+  const files = items.filter(i => i.kind === "file").map(i => i.getAsFile()).filter(Boolean);
+  if(!files.length) return;      // texto pelado: que siga su camino normal
+  e.preventDefault();
+  if(!activa || !abiertas[activa]){ aviso("Abrí una sesión antes de pegar", true); return; }
+  const enCajon = MOVIL && document.activeElement === $("#texto-m");
+  aviso(files.length === 1 ? "Subiendo la captura…" : "Subiendo " + files.length + " archivos…");
+  let pegar = "", fallaron = 0;
+  for(const f of files){
+    const ext = (f.type.split("/")[1] || "png").replace(/[^\w]/g, "");
+    // hora LOCAL, no UTC: el nombre del archivo tiene que coincidir con la hora
+    // del reloj de uno o después no se sabe cuál captura es cuál
+    const d = new Date(), dd = n => String(n).padStart(2, "0");
+    const nombre = f.name || ("captura-" + d.getFullYear() + "-" +
+      dd(d.getMonth()+1) + "-" + dd(d.getDate()) + "-" +
+      dd(d.getHours()) + dd(d.getMinutes()) + dd(d.getSeconds()) + "." + ext);
+    try{
+      const r = await fetch("/api/subir?nombre=" + encodeURIComponent(nombre),
+                            {method:"POST", body:f});
+      const j = await r.json();
+      if(j.ruta) pegar += '"' + j.ruta + '" '; else fallaron++;
+    }catch(err){ fallaron++; }
+  }
+  if(!pegar){ aviso("No pude subir " + (files.length === 1 ? "la captura" : "los archivos"), true); return; }
+  if(enCajon){
+    const ta = $("#texto-m");
+    ta.value = (ta.value ? ta.value.replace(/\s+$/, "") + " " : "") + pegar;
+    ta.dispatchEvent(new Event("input"));
+  } else {
+    mandar("\x1b[200~" + pegar + "\x1b[201~");
+    abiertas[activa].term.focus();
+  }
+  aviso(fallaron ? "Subí " + (files.length - fallaron) + " de " + files.length :
+        "Listo: la ruta quedó en la sesión — escribí qué querés y mandá ⏎", !!fallaron);
+});
+
+/* ---- ⌘K: buscador de sesiones y proyectos --------------------------------
+   Con la lista larga, encontrar "la sesión de Meta Ads" con el ojo cuesta más
+   que escribir tres letras. Busca en título, proyecto y snippet; si no hay
+   sesión que coincida, ofrece abrir una NUEVA en el proyecto que matchee. */
+let paletaOpts = [], paletaSel = 0;
+
+function opcionesPaleta(q){
+  const norm = s => String(s || "").toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "");   // "meta ads" encuentra "Metá"
+  const t = norm(q).trim();
+  const casa = o => !t || norm(o.titulo + " " + o.proyecto + " " + (o.ultimo_txt||"")).includes(t);
+  const out = [];
+  estado.tabs.map(x => Object.assign({__tab:true}, x)).filter(casa).forEach(o =>
+    out.push({icono:"●", qué:o.titulo, dónde:o.proyecto, estado:o.estado,
+              hacer:() => abrirTab(o.id)}));
+  estado.afuera.filter(s => s.viva).filter(casa).forEach(o =>
+    out.push({icono: o.tipo === "terminal" ? "▣" : "⚙", qué:o.titulo,
+              dónde: o.proyecto + (o.tipo === "terminal" ? " · Terminal" : " · automática"),
+              estado:o.estado,
+              hacer:() => o.tipo === "terminal" && o.tty
+                ? fetch("/api/abrir?tty=" + o.tty, {method:"POST"}).catch(()=>{})
+                : abrirVer(o.id, o.titulo, o.viva)}));
+  estado.afuera.filter(s => !s.viva).filter(casa).slice(0, 8).forEach(o =>
+    out.push({icono:"◌", qué:o.titulo, dónde:o.proyecto + " · terminada",
+              estado:"terminada", hacer:() => abrirVer(o.id, o.titulo, false)}));
+  estado.proyectos.filter(p => !t || norm(p.nombre).includes(t)).forEach(p =>
+    out.push({icono:"＋", qué:"Nueva sesión en " + p.nombre, dónde:"", estado:"",
+              hacer:() => nueva(p.cwd)}));
+  return out.slice(0, 40);
+}
+
+function pintarPaleta(){
+  const res = $("#paleta-res");
+  if(!paletaOpts.length){ res.innerHTML = '<div class="vacio">Nada con eso.</div>'; return; }
+  res.innerHTML = paletaOpts.map((o, i) => `
+    <div class="op ${i===paletaSel?"sel":""}" data-i="${i}">
+      <span class="dot ${esc(o.estado)}" style="${o.estado?"":"display:none"}"></span>
+      <span class="qué">${esc(o.icono)} ${esc(o.qué)}</span>
+      <span class="dónde">${esc(o.dónde)}</span>
+    </div>`).join("");
+  const sel = res.querySelector(".op.sel");
+  if(sel) sel.scrollIntoView({block:"nearest"});
+}
+
+function abrirPaleta(){
+  $("#paleta").classList.add("ver");
+  $("#paleta-q").value = "";
+  paletaSel = 0; paletaOpts = opcionesPaleta("");
+  pintarPaleta();
+  setTimeout(() => $("#paleta-q").focus(), 0);
+}
+function cerrarPaleta(){
+  $("#paleta").classList.remove("ver");
+  const a = abiertas[activa];
+  if(a && !MOVIL) a.term.focus();
+}
+$("#paleta-q").addEventListener("input", e => {
+  paletaOpts = opcionesPaleta(e.target.value); paletaSel = 0; pintarPaleta();
+});
+$("#paleta-q").addEventListener("keydown", e => {
+  if(e.key === "ArrowDown"){ e.preventDefault(); paletaSel = Math.min(paletaSel+1, paletaOpts.length-1); pintarPaleta(); }
+  else if(e.key === "ArrowUp"){ e.preventDefault(); paletaSel = Math.max(paletaSel-1, 0); pintarPaleta(); }
+  else if(e.key === "Enter"){ e.preventDefault(); const o = paletaOpts[paletaSel]; if(o){ cerrarPaleta(); o.hacer(); } }
+  else if(e.key === "Escape"){ e.preventDefault(); cerrarPaleta(); }
+});
+$("#paleta").addEventListener("click", e => {
+  const op = e.target.closest(".op");
+  if(op){ const o = paletaOpts[+op.dataset.i]; cerrarPaleta(); if(o) o.hacer(); return; }
+  if(e.target.id === "paleta") cerrarPaleta();   // click en el velo
+});
+// El atajo va en captura: xterm se come el keydown si el foco está en la terminal.
+document.addEventListener("keydown", e => {
+  if((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")){
+    e.preventDefault(); e.stopPropagation();
+    $("#paleta").classList.contains("ver") ? cerrarPaleta() : abrirPaleta();
+  }
+}, true);
+
 async function refrescar(){
   if(pausaRefresco) return;   // hay un arrastre en curso: no repintar la lista debajo
   try{
@@ -2282,7 +2614,14 @@ async function refrescar(){
     const j = await r.json();
     if(j.error) throw new Error(j.error);
     estado = j;
+    revisarAvisos();          // antes de render(): el 🔔 se pinta en la lista
     render();
+    if(MOVIL) pintarModo();   // por si cambiaste el modo desde otro lado
+    if($("#paleta").classList.contains("ver")){
+      paletaOpts = opcionesPaleta($("#paleta-q").value);
+      paletaSel = Math.min(paletaSel, Math.max(0, paletaOpts.length - 1));
+      pintarPaleta();
+    }
   }catch(err){
     $("#pie").textContent = "sin conexión con el server… (" + err.message + ")";
   }
