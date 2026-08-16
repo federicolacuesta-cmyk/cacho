@@ -57,21 +57,50 @@ fi
 PIN=\$(cat "\$HOME/.cacho_pin" 2>/dev/null || true)
 [ -n "\$PIN" ] && URL="\$URL/?pin=\$PIN"
 
-# 2. si ya hay una ventana de la app, traerla al frente; si no, abrirla
+# 2. si ya hay una ventana de la app, traerla al frente EN SERIO; si no, abrirla.
+#    (15-ago-2026) La versión vieja matcheaba por título "Cacho" (cualquier
+#    pestaña con ese nombre la engañaba) y hacía solo "set index to 1", que en
+#    Chrome NO levanta la ventana si está minimizada o detrás de otra →
+#    apretabas el ícono y "no pasaba nada". Ahora: identidad por URL, se
+#    desminimiza, se sube y se VERIFICA que quedó al frente; si no quedó, se
+#    cierra y se abre de nuevo (la página es un visor sin estado: las sesiones
+#    viven en el server, cerrar la ventana no pierde nada).
 if pgrep -x "Google Chrome" > /dev/null; then
-  YA=\$(osascript -e 'tell application "Google Chrome"
-    repeat with w in windows
-      if title of w contains "Cacho" then
-        set index of w to 1
-        return "si"
-      end if
-    end repeat
-    return "no"
-  end tell' 2>/dev/null)
-  if [ "\$YA" = "si" ]; then
-    osascript -e 'tell application "Google Chrome" to activate'
-    exit 0
-  fi
+  YA=\$(osascript 2>/dev/null <<'OSA'
+tell application "Google Chrome"
+  -- OJO: operar SIEMPRE por "window id": las referencias por posicion
+  -- (item N of windows) se corren al mover/cerrar ventanas y terminan
+  -- cerrando la ventana equivocada (paso el 15-ago: cerro un Gemini ajeno).
+  set ids to {}
+  repeat with w in windows
+    try
+      if URL of active tab of w contains "127.0.0.1:8811" then set end of ids to (id of w)
+    end try
+  end repeat
+  if (count of ids) is 0 then return "no"
+  repeat with i from 2 to (count of ids)
+    try
+      close (window id (item i of ids))
+    end try
+  end repeat
+  set principal to window id (item 1 of ids)
+  try
+    set minimized of principal to false
+  end try
+  activate
+  set index of principal to 1
+  delay 0.3
+  try
+    if URL of active tab of front window contains "127.0.0.1:8811" then return "si"
+  end try
+  try
+    close principal
+  end try
+  return "reabrir"
+end tell
+OSA
+)
+  if [ "\$YA" = "si" ]; then exit 0; fi
 fi
 open -na "Google Chrome" --args --app="\$URL"
 LANZADOR

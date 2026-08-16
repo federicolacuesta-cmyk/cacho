@@ -45,7 +45,14 @@ AQUI = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("CACHO_PORT", "8811"))
 BIND = "127.0.0.1"   # NO cambiar a 0.0.0.0: expondría terminales por red
 CHUNK = 256 * 1024   # bytes que se leen de cabeza/cola de cada transcript
-TOPE_BUFFER = 600_000  # scrollback que se guarda por terminal (bytes)
+TOPE_BUFFER = 2_000_000  # scrollback por terminal; es lo que se re-manda al reconectar
+
+# Identidad de ESTE arranque del server. La página lo compara contra /api/ping
+# y se recarga sola si cambió: reiniciar el server NO recarga las ventanas de
+# Chrome ya abiertas (open -a solo las trae al frente), y sin esto quedaban
+# corriendo el JS viejo para siempre (reiniciabas el server y seguías viendo
+# la UI anterior).
+BOOT_ID = uuid.uuid4().hex
 
 # PIN de acceso (ver docstring). Un PIN por máquina, persistido en ~/.cacho_pin.
 PIN_PATH = os.path.expanduser("~/.cacho_pin")
@@ -409,8 +416,13 @@ class TermSession:
         )
         try:
             os.write(self.master, cmd.encode() + b"\r")
-        except OSError:
-            pass
+        except OSError as e:
+            msg = (f"\r\n>> No pude arrancar claude en esta pestaña ({e})."
+                   "\r\n>> Cerrala y abri otra.\r\n").encode()
+            with self.lock:
+                self.buf += msg
+                for q in list(self.subs):
+                    q.put(msg)
 
     def _leer(self):
         while True:
@@ -464,22 +476,121 @@ TABS = {}          # id -> TermSession
 TABS_LOCK = threading.Lock()
 _mapeo_pid = {}    # transcript_id -> pid del proceso claude que le corresponde
 
+# ─── Metadatos por sesión: FIJADA / ORDEN / NOMBRE PROPIO ───
+# Primer estado persistente de Cacho: hasta ahora TODO era memoria y se perdía al
+# reiniciar el server. Va FUERA del repo (es preferencia de máquina, no dato del negocio).
+#
+# La clave es el transcript_id (el UUID del .jsonl), NO el id de pestaña: ese es
+# uuid4()[:8] nuevo en cada arranque del server, así que el pineo no sobreviviría a un
+# reinicio. Ojo: una pestaña recién creada no tiene transcript_id hasta que
+# `_vincular_transcripts` la empareja (~1-5 s); hasta entonces simplemente no tiene meta.
+META_DIR = os.path.expanduser("~/Library/Application Support/Cacho")
+META_FILE = os.path.join(META_DIR, "sesiones.json")
+_meta_cache = {"mtime": 0, "datos": {}}
+META_LOCK = threading.Lock()
+
+
+def _meta_leer():
+    """Metadatos {sid: {"fija": bool, "orden": int, "nombre": str}}. Cacheado por mtime:
+    /api/estado se pide cada 4 s por cliente, no se relee el disco cada vez."""
+    with META_LOCK:
+        try:
+            m = os.path.getmtime(META_FILE)
+        except OSError:
+            _meta_cache.update(mtime=0, datos={})
+            return {}
+        if m != _meta_cache["mtime"]:
+            try:
+                with open(META_FILE, encoding="utf-8") as fh:
+                    d = json.load(fh)
+                _meta_cache.update(mtime=m, datos=d if isinstance(d, dict) else {})
+            except Exception:
+                _meta_cache.update(mtime=m, datos={})   # archivo corrupto: no tumba Cacho
+        return dict(_meta_cache["datos"])
+
+
+def _meta_set(sid, campos):
+    """Aplica cambios de UNA sesión y persiste. Escritura atómica (tmp + replace) bajo
+    lock: el server es multi-thread y dos pestañas pueden guardar a la vez."""
+    with META_LOCK:
+        datos = {}
+        try:
+            with open(META_FILE, encoding="utf-8") as fh:
+                datos = json.load(fh)
+            if not isinstance(datos, dict):
+                datos = {}
+        except Exception:
+            pass
+        actual = dict(datos.get(sid) or {})
+        for k, v in campos.items():
+            if v is None:
+                actual.pop(k, None)          # None = volver al valor por defecto
+            else:
+                actual[k] = v
+        if actual:
+            datos[sid] = actual
+        else:
+            datos.pop(sid, None)             # sin nada que recordar, no dejar basura
+        os.makedirs(META_DIR, exist_ok=True)
+        tmp = META_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(datos, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, META_FILE)
+        _meta_cache.update(mtime=os.path.getmtime(META_FILE), datos=datos)
+        return actual
+
+
+def _aplicar_meta(item, sid, meta):
+    """Agrega a un item de la lista sus campos de meta. El NOMBRE PROPIO gana sobre el
+    título del transcript — que si no lo pisaría en la próxima lectura, cada 4 s."""
+    m = meta.get(sid) or {}
+    item["sid"] = sid or ""
+    item["fija"] = bool(m.get("fija"))
+    item["orden"] = m.get("orden")
+    if m.get("nombre"):
+        item["titulo"] = m["nombre"]
+        item["renombrada"] = True
+    return item
+
 
 def _vincular_transcripts(tabs, parseadas):
-    """Asocia cada pestaña de la app con su transcript (título y estado)."""
+    """Asocia cada pestaña de la app con su transcript (título y estado).
+
+    El transcript nace ~1 s después de que la pestaña lanza `claude`, así que
+    la señal firme es primer_ts ≈ t.creado. Antes se elegía max(mtime) entre
+    los candidatos y, con varias pestañas del mismo proyecto, la pestaña más
+    vieja sin vincular le robaba el transcript a una más nueva (títulos
+    entreverados, y el cruce quedaba pegado). Ahora el emparejado es global:
+    gana el par (pestaña, transcript) con menor |primer_ts − creado|.
+    """
     por_id = {p["id"]: p for p in parseadas}
     usadas = set()
-    for t in sorted(tabs, key=lambda x: x.creado):
+    pendientes = []
+    for t in tabs:
         if t.transcript_id and t.transcript_id in por_id:
             usadas.add(t.transcript_id)
+        elif not t.transcript_id:
+            pendientes.append(t)
+        # transcript_id seteado pero sin parsear hoy (p. ej. resume de una
+        # charla vieja sin actividad aún): se respeta, no se re-adivina
+
+    pares = []
+    for t in pendientes:
+        for p in parseadas:
+            if p["cwd"] != t.cwd or p["id"] in usadas:
+                continue
+            delta = _iso_a_epoch(p["primer_ts"]) - t.creado
+            if delta >= -60:
+                pares.append((abs(delta), t.creado, t, p))
+    pares.sort(key=lambda x: (x[0], x[1]))
+    vinculadas = set()
+    for _, _, t, p in pares:
+        if id(t) in vinculadas or p["id"] in usadas:
             continue
-        cands = [p for p in parseadas
-                 if p["cwd"] == t.cwd and p["id"] not in usadas
-                 and _iso_a_epoch(p["primer_ts"]) >= t.creado - 60]
-        if cands:
-            mejor = max(cands, key=lambda p: p["mtime"])
-            t.transcript_id = mejor["id"]
-            usadas.add(mejor["id"])
+        t.transcript_id = p["id"]
+        usadas.add(p["id"])
+        vinculadas.add(id(t))
+
     for t in tabs:
         p = por_id.get(t.transcript_id)
         if p:
@@ -490,6 +601,7 @@ def _vincular_transcripts(tabs, parseadas):
 def estado_general():
     ahora = time.time()
     parseadas = _sesiones_parseadas()
+    meta = _meta_leer()
     with TABS_LOCK:
         tabs = list(TABS.values())
     usadas = _vincular_transcripts(tabs, parseadas)
@@ -503,14 +615,14 @@ def estado_general():
             estado = "trabajando" if (ahora - p["mtime"]) < 60 else "esperando"
         else:
             estado = "trabajando" if (ahora - t.last_out) < 6 else "esperando"
-        tabs_json.append({
+        tabs_json.append(_aplicar_meta({
             "id": t.id, "cwd": t.cwd, "proyecto": _proyecto_lindo(t.cwd),
             "titulo": t.titulo or "Nueva sesión", "estado": estado,
             "viva": t.viva,
             "hace_seg": int(ahora - (p["mtime"] if p else t.last_out)),
             "ultimo_quien": p["ultimo_quien"] if p else "",
             "ultimo_txt": p["ultimo_txt"] if p else "",
-        })
+        }, t.transcript_id, meta))
 
     ttys_mios = {t.tty.replace("/dev/", "") for t in tabs}
     procs = procesos_claude(ttys_mios)
@@ -556,6 +668,9 @@ def estado_general():
         s["proyecto"] = _proyecto_lindo(s["cwd"])
         s["hace_seg"] = int(ahora - s["mtime"])
         s.pop("mtime", None)
+
+    for s in afuera:
+        _aplicar_meta(s, s["id"], meta)
 
     orden = {"trabajando": 0, "esperando": 1, "terminada": 2}
     afuera.sort(key=lambda s: (orden[s["estado"]], s["hace_seg"]))
@@ -767,7 +882,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(cuerpo)
         elif ruta == "/api/ping":
-            self._json({"ok": True})
+            self._json({"ok": True, "boot": BOOT_ID})
         elif ruta == "/api/estado":
             try:
                 self._json(estado_general())
@@ -863,6 +978,31 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not self._pin_recibido():
             return self._json({"error": "falta el PIN"}, 403)
+
+        if ruta.startswith("/api/sesion/") and ruta.endswith("/meta"):
+            # Fijar arriba / renombrar / reordenar una sesión de la barra izquierda.
+            sid = ruta.split("/")[3]
+            if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", sid):
+                return self._json({"error": "id inválido"}, 400)
+            try:
+                d = json.loads(self._body().decode("utf-8", "replace") or "{}")
+            except ValueError:
+                return self._json({"error": "json inválido"}, 400)
+            campos = {}
+            if "fija" in d:
+                campos["fija"] = bool(d["fija"]) or None      # False = borrar la clave
+            if "nombre" in d:
+                # el nombre lo escribe el usuario: se recorta y se limpian los saltos
+                n = re.sub(r"\s+", " ", str(d["nombre"] or "")).strip()[:80]
+                campos["nombre"] = n or None                  # vacío = volver al automático
+            if "orden" in d:
+                try:
+                    campos["orden"] = int(d["orden"])
+                except (TypeError, ValueError):
+                    campos["orden"] = None
+            if not campos:
+                return self._json({"error": "nada que guardar"}, 400)
+            return self._json({"ok": True, "meta": _meta_set(sid, campos)})
 
         if ruta == "/api/term/new":
             cwd = q.get("cwd", [""])[0]
@@ -1009,13 +1149,13 @@ PAGINA = r"""<!doctype html>
 <style>
 :root{
   --bg:#FAF9F5; --panel:#F0EEE6; --card:#FFFFFF; --borde:#E3E0D5;
-  --tinta:#1F1E1B; --gris:#6E6C64; --coral:#D97757; --ocre:#B8860B;
+  --tinta:#1F1E1B; --gris:#6E6C64; --acento:#2D9CDB; --ocre:#B8860B;
   --term-bg:#1E1D1B;
 }
 @media (prefers-color-scheme: dark){
   :root{
     --bg:#262624; --panel:#1F1E1C; --card:#30302E; --borde:#3B3A36;
-    --tinta:#F5F4EF; --gris:#A8A69D;
+    --tinta:#F5F4EF; --gris:#A8A69D; --acento:#4FB3E8;
   }
 }
 *{box-sizing:border-box; margin:0; padding:0}
@@ -1026,6 +1166,10 @@ body{
 }
 /* ---------- barra lateral ---------- */
 #side{
+  /* la barra va SIEMPRE oscura, aunque el dispositivo esté en modo claro —
+     el resto de la app sigue el tema del sistema */
+  --panel:#1F1E1C; --card:#30302E; --borde:#3B3A36;
+  --tinta:#F5F4EF; --gris:#A8A69D; --acento:#4FB3E8;
   width:300px; flex:none; background:var(--panel); border-right:1px solid var(--borde);
   display:flex; flex-direction:column; padding:14px 10px 10px;
 }
@@ -1033,11 +1177,11 @@ body{
   font-family:Georgia, serif; font-weight:500; font-size:19px;
   display:flex; align-items:center; gap:8px; padding:2px 8px 12px;
 }
-#side h1 .logo{color:var(--coral); font-size:17px}
+#side h1 .logo{color:var(--acento); font-size:17px}
 .logo-foto{width:32px; height:32px; border-radius:50%; flex:none}
 #btn-nueva{
   display:flex; align-items:center; gap:8px; width:100%;
-  background:var(--coral); color:#fff; border:0; border-radius:10px;
+  background:var(--acento); color:#fff; border:0; border-radius:10px;
   padding:9px 14px; font-size:12px; font-weight:600; cursor:pointer;
 }
 #btn-nueva:hover{filter:brightness(.95)}
@@ -1060,13 +1204,13 @@ body{
   border-radius:10px; padding:8px 10px; cursor:pointer; margin-bottom:2px;
 }
 .item:hover{background:var(--card)}
-.item.activo{background:var(--card); box-shadow:inset 2px 0 0 var(--coral)}
+.item.activo{background:var(--card); box-shadow:inset 2px 0 0 var(--acento)}
 .item .fila{display:flex; align-items:center; gap:8px}
 .dot{width:8px; height:8px; border-radius:50%; flex:none}
-.dot.trabajando{background:var(--coral); animation:lat 1.4s ease-in-out infinite}
+.dot.trabajando{background:var(--acento); animation:lat 1.4s ease-in-out infinite}
 .dot.esperando{background:var(--ocre)}
 .dot.terminada{background:var(--gris); opacity:.5}
-@keyframes lat{0%,100%{box-shadow:0 0 0 0 rgba(217,119,87,.5)}50%{box-shadow:0 0 0 5px rgba(217,119,87,0)}}
+@keyframes lat{0%,100%{box-shadow:0 0 0 0 rgba(45,156,219,.5)}50%{box-shadow:0 0 0 5px rgba(45,156,219,0)}}
 .item .tit{
   flex:1; font-size:12.5px; font-weight:500; white-space:nowrap;
   overflow:hidden; text-overflow:ellipsis;
@@ -1084,7 +1228,21 @@ body{
   font-size:12px; padding:0 3px; border-radius:4px; flex:none;
 }
 .item .x:hover{opacity:1; color:var(--tinta)}
-.item .x.confirmar{color:#fff; background:var(--coral); opacity:1}
+.item .x.confirmar{color:#fff; background:var(--acento); opacity:1}
+/* Fijar arriba / renombrar: aparecen al pasar por encima para no ensuciar la lista.
+   En el celular no hay hover, así que ahí van siempre visibles (media query abajo). */
+.item .acc{
+  background:none; border:0; color:var(--gris); cursor:pointer; font-size:11px;
+  padding:0 2px; opacity:0; transition:opacity .12s;
+}
+.item:hover .acc{opacity:.75}
+.item .acc:hover{opacity:1}
+.item .acc.fijar.on{opacity:1}
+.item.fijada{background:var(--card); box-shadow:inset 2px 0 0 #d9a441}
+.item.fijada .tit{font-weight:600}
+.item.fijada[draggable="true"]{cursor:grab}
+.item.arrastrando{opacity:.45; cursor:grabbing}
+.item .tit.propio{font-style:normal}
 #pie{color:var(--gris); font-size:10.5px; padding:10px 8px 2px}
 /* ---------- zona principal ---------- */
 #main{flex:1; display:flex; flex-direction:column; min-width:0}
@@ -1120,7 +1278,7 @@ body{
 #btn-retomar{flex:none; border:1px solid var(--borde); background:var(--card);
   color:var(--tinta); border-radius:8px; padding:4px 12px; font-size:11.5px;
   font-weight:600; cursor:pointer}
-#btn-retomar:hover{background:var(--coral); color:#fff; border-color:var(--coral)}
+#btn-retomar:hover{background:var(--acento); color:#fff; border-color:var(--acento)}
 .ver-cuerpo{flex:1; overflow-y:auto; padding:14px 16px}
 .msg{margin-bottom:12px; max-width:860px}
 .msg .quien{font-size:10.5px; font-weight:700; color:var(--gris);
@@ -1128,30 +1286,38 @@ body{
 .msg .quien .hora{font-weight:400; text-transform:none; letter-spacing:0; margin-left:6px}
 .msg .texto{white-space:pre-wrap; overflow-wrap:anywhere; font-size:13px; line-height:1.5;
   background:var(--panel); border:1px solid var(--borde); border-radius:10px; padding:8px 12px}
-.msg.vos .texto{background:transparent; border-color:var(--coral); border-width:1px}
+.msg.vos .texto{background:transparent; border-color:var(--acento); border-width:1px}
 .msg.tool .texto{color:var(--gris); font-size:11.5px; font-style:italic;
   background:transparent; border-style:dashed; padding:5px 12px}
 .ver-nota{color:var(--gris); font-size:11px; text-align:center; padding:4px 0 10px}
-#vacio .logo{color:var(--coral); font-size:34px}
+#vacio .logo{color:var(--acento); font-size:34px}
 /* dictado de macOS: el texto en composición debe envolver, no irse de largo */
 .xterm .composition-view{
   white-space:pre-wrap !important; word-break:break-all;
   max-width:100%; overflow-wrap:anywhere;
 }
-#terms.arrastrando .term-box.ver{outline:2px dashed var(--coral); outline-offset:-6px}
+#terms.arrastrando .term-box.ver{outline:2px dashed var(--acento); outline-offset:-6px}
 /* ---------- dictado por micrófono (escritorio, Chrome) ---------- */
 #btn-mic, #btn-enviar-esc{
-  position:absolute; bottom:28px; z-index:12; display:none;
-  width:46px; height:46px; border-radius:50%; cursor:pointer;
-  box-shadow:0 4px 16px rgba(0,0,0,.25); align-items:center; justify-content:center;
+  /* bottom = CENTRO del botón (translateY lo baja media altura): quedan
+     centrados en la fila del "> " de Claude Code, entre las dos líneas.
+     La var la calcula ubicarBotones() midiendo el terminal real. */
+  position:absolute; bottom:var(--centro-botones, 69px); transform:translateY(50%);
+  z-index:12; display:none;
+  width:34px; height:34px; border-radius:50%; cursor:pointer;
+  box-shadow:0 2px 8px rgba(0,0,0,.18); align-items:center; justify-content:center;
+  opacity:.92; transition:bottom .18s ease-out;
 }
-#btn-mic{right:84px; border:1px solid var(--borde); background:var(--card); color:var(--gris)}
-#btn-enviar-esc{right:28px; border:none; background:var(--coral); color:#fff}
+@media (prefers-reduced-motion: reduce){
+  #btn-mic, #btn-enviar-esc{transition:none}
+}
+#btn-mic{right:64px; border:1px solid var(--borde); background:var(--card); color:var(--gris)}
+#btn-enviar-esc{right:22px; border:none; background:var(--acento); color:#fff}
 #btn-mic.ver, #btn-enviar-esc.ver{display:flex}
 #btn-mic:hover, #btn-enviar-esc:hover{filter:brightness(.97)}
-#btn-mic.grabando{background:var(--coral); border-color:var(--coral); color:#fff; animation:lat 1.4s ease-in-out infinite}
+#btn-mic.grabando{background:var(--acento); border-color:var(--acento); color:#fff; animation:lat 1.4s ease-in-out infinite}
 #mic-live{
-  position:absolute; right:28px; bottom:84px; z-index:12; max-width:440px;
+  position:absolute; right:22px; bottom:calc(var(--centro-botones, 69px) + 27px); z-index:12; max-width:440px;
   background:var(--card); border:1px solid var(--borde); border-radius:12px;
   padding:10px 14px; font-size:13px; line-height:1.45; color:var(--tinta);
   box-shadow:0 6px 24px rgba(0,0,0,.25); display:none; white-space:pre-wrap;
@@ -1167,6 +1333,9 @@ body{
 #input-m{display:none}
 @media (max-width:700px){
   body{flex-direction:column}
+  /* En el celular no hay hover: los botones de fijar/renombrar van siempre visibles
+     y más grandes, que se puedan tocar con el dedo. */
+  .item .acc{opacity:.8; font-size:15px; padding:2px 5px}
   #barra-m{
     display:flex; align-items:center; gap:10px; flex:none;
     padding:calc(env(safe-area-inset-top) + 10px) 14px 10px;
@@ -1225,7 +1394,7 @@ body{
   }
   #btn-enviar{
     flex:none; width:38px; height:38px; border:0; border-radius:50%;
-    background:var(--coral); color:#fff; font-size:17px;
+    background:var(--acento); color:#fff; font-size:17px;
   }
   #btn-enviar:active{filter:brightness(.85)}
   #btn-adj{
@@ -1233,6 +1402,16 @@ body{
     border-radius:50%; background:var(--card); color:var(--tinta); font-size:20px;
   }
   #btn-adj:active{background:var(--borde)}
+  #btn-mic-m{
+    flex:none; width:38px; height:38px; border:1px solid var(--borde);
+    border-radius:50%; background:var(--card); color:var(--tinta);
+    display:flex; align-items:center; justify-content:center;
+  }
+  #btn-mic-m:active{background:var(--borde)}
+  #btn-mic-m.grabando{
+    background:var(--acento); border-color:var(--acento); color:#fff;
+    animation:lat 1.4s ease-in-out infinite;
+  }
 }
 /* avisos no bloqueantes (creando sesión, subiendo archivo, errores) */
 #aviso-m{
@@ -1243,7 +1422,7 @@ body{
   box-shadow:0 6px 24px rgba(0,0,0,.25);
 }
 #aviso-m.ver{display:block}
-#aviso-m.error{border-color:var(--coral); color:var(--coral)}
+#aviso-m.error{border-color:#D9534F; color:#D9534F}
 </style>
 </head>
 <body>
@@ -1264,8 +1443,8 @@ body{
 <div id="main">
   <div id="terms">
     <div id="vacio"><img src="/static/cacho.png" style="width:84px;height:84px;border-radius:50%">Abrí una sesión nueva o elegí una de la izquierda.</div>
-    <button id="btn-mic" title="Dictar por micrófono"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg></button>
-    <button id="btn-enviar-esc" title="Enviar (Enter en la sesión activa)"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg></button>
+    <button id="btn-mic" title="Dictar por micrófono"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg></button>
+    <button id="btn-enviar-esc" title="Enviar (Enter en la sesión activa)"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg></button>
     <div id="mic-live"></div>
   </div>
   <div id="input-m">
@@ -1282,6 +1461,7 @@ body{
       <input type="file" id="file-m" multiple style="display:none">
       <textarea id="texto-m" rows="1" enterkeyhint="send" autocapitalize="sentences"
         placeholder="Escribile a la sesión…"></textarea>
+      <button id="btn-mic-m" title="Dictar por micrófono"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg></button>
       <button id="btn-enviar" title="Enviar">➤</button>
     </div>
   </div>
@@ -1296,7 +1476,10 @@ let abiertas = {};        // id -> {term, fit, es, box}
 let activa = null;
 let confirmarX = null;
 
-function esc(t){const d=document.createElement("div");d.textContent=t||"";return d.innerHTML}
+// escapa TAMBIÉN comillas: esc() se usa dentro de atributos (data-vtit,
+// data-cwd…) y un título con " rompía el HTML de la barra lateral entera
+function esc(t){return String(t==null?"":t).replace(/[&<>"']/g,
+  c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
 function hace(seg){
   if(seg < 60) return seg + " s";
   if(seg < 3600) return Math.floor(seg/60) + " min";
@@ -1316,6 +1499,13 @@ function b64de(str){
 // aviso flotante no bloqueante (nada de alert(): en el teléfono no se ve
 // qué falló y en el escritorio corta el flujo)
 let avisoTimer = null;
+let ptyAvisado = 0;   // freno: onData dispara por tecla, no repetir el aviso
+function avisoPty(){
+  const t = Date.now();
+  if(t - ptyAvisado < 5000) return;
+  ptyAvisado = t;
+  aviso("La sesión ya no acepta escritura (¿terminó?)", true);
+}
 function aviso(txt, error){
   const el = $("#aviso-m");
   if(!el) return;
@@ -1328,6 +1518,34 @@ function aviso(txt, error){
 }
 
 /* ---------------- terminales ---------------- */
+/* Botones flotantes (mic + enviar): centrados en la fila del input de
+   Claude Code. La caja del prompt son dos líneas de "─"; se busca la de
+   ABAJO en las últimas filas visibles y los botones se centran en la fila
+   inmediatamente arriba (la del ">"). Así no importa cuántas filas tenga
+   el pie (estado, avisos): se mide lo que hay, no se adivina. Si no se
+   encuentra caja (shell pelado, buffer scrolleado) no se toca nada. */
+function ubicarBotones(){
+  if(MOVIL || !activa) return;
+  const a = abiertas[activa];
+  if(!a) return;
+  const screen = a.box.querySelector(".xterm-screen");
+  if(!screen || !a.term.rows) return;
+  const sr = screen.getBoundingClientRect(), tr = $("#terms").getBoundingClientRect();
+  if(!sr.height) return;
+  const h = sr.height / a.term.rows;
+  const buf = a.term.buffer.active;
+  for(let f = a.term.rows - 1; f >= Math.max(1, a.term.rows - 6); f--){
+    const linea = buf.getLine(buf.viewportY + f);
+    if(!linea) continue;
+    const guiones = (linea.translateToString(true).match(/─/g) || []).length;
+    if(guiones > a.term.cols * .5){
+      // centro de la fila f-1 (el input), medido desde abajo de #terms
+      const centro = (tr.bottom - sr.bottom) + (a.term.rows - f + .5) * h;
+      $("#terms").style.setProperty("--centro-botones", centro.toFixed(1) + "px");
+      return;
+    }
+  }
+}
 function abrirTab(id){
   if(abiertas[id]){ activar(id); return; }
   const box = document.createElement("div");
@@ -1337,8 +1555,8 @@ function abrirTab(id){
     fontFamily:'"SF Mono", Menlo, monospace', fontSize: MOVIL ? 12 : 15,
     cursorBlink:true, scrollback:8000, allowProposedApi:true,
     theme:{
-      background:"#1E1D1B", foreground:"#E8E6DC", cursor:"#D97757",
-      cursorAccent:"#1E1D1B", selectionBackground:"rgba(217,119,87,.35)"
+      background:"#1E1D1B", foreground:"#E8E6DC", cursor:"#2D9CDB",
+      cursorAccent:"#1E1D1B", selectionBackground:"rgba(45,156,219,.35)"
     }
   });
   const fit = new FitAddon.FitAddon();
@@ -1348,8 +1566,28 @@ function abrirTab(id){
   // oculto de xterm (iOS lo rompe: autocorrector duplica el texto). Se
   // escribe siempre por la barra de abajo (#input-m).
   if(MOVIL && term.textarea) term.textarea.setAttribute("inputmode", "none");
+  // reubicar los botones flotantes cuando el terminal pinta (solo la pestaña
+  // activa tiene stream, así que esto no corre por pestañas de fondo)
+  if(!MOVIL && term.onWriteParsed){
+    let t = null;
+    term.onWriteParsed(() => { clearTimeout(t); t = setTimeout(ubicarBotones, 200); });
+  }
+  // dictando con el mic de escritorio, Enter en el TECLADO debe pegar lo
+  // dictado antes de enviarse — sin esto Claude recibía un Enter con el
+  // input vacío y lo dictado quedaba colgado en el globo (14-ago-2026)
+  term.attachCustomKeyEventHandler(ev => {
+    if(ev.type === "keydown" && ev.key === "Enter" && micActivo && micTab === id
+       && !ev.shiftKey && !ev.altKey && !ev.ctrlKey && !ev.metaKey){
+      micParar(() => fetch(`/api/term/${id}/input`, {method:"POST",
+        body: JSON.stringify({d: b64de("\r")})}).catch(()=>{}));
+      return false;   // este Enter no pasa a la terminal: va después del paste
+    }
+    return true;
+  });
   term.onData(d => fetch(`/api/term/${id}/input`, {
     method:"POST", body: JSON.stringify({d: b64de(d)})
+  }).then(r => r.json()).then(j => {
+    if(j && j.ok === false) avisoPty();   // el server dice por qué no escribe
   }).catch(()=>{}));
   term.onResize(({cols, rows}) => fetch(`/api/term/${id}/resize`, {
     method:"POST", body: JSON.stringify({cols, rows})
@@ -1371,9 +1609,17 @@ function conectar(id){
   const es = new EventSource(`/api/term/${id}/stream`);
   es.onmessage = e => a.term.write(b64bytes(e.data));
   es.addEventListener("fin", () => {
-    a.term.write("\r\n\x1b[38;2;217;119;87m— sesión terminada —\x1b[0m\r\n");
+    a.term.write("\r\n\x1b[38;2;45;156;219m— sesión terminada —\x1b[0m\r\n");
     es.close(); a.es = null;
   });
+  es.onerror = () => {
+    // readyState 2 = CLOSED: el navegador NO va a reintentar (error HTTP o
+    // corte definitivo). Sin esto la terminal quedaba congelada muda.
+    if(es.readyState === 2){
+      a.es = null;
+      a.term.write("\r\n\x1b[38;2;110;108;100m— conexión cortada: tocá la sesión en la barra para reconectar —\x1b[0m\r\n");
+    }
+  };
   a.es = es;
 }
 function desconectar(id){
@@ -1399,6 +1645,7 @@ function activar(id){
       // resize explícito: sin esto el pty puede quedar con el ancho viejo
       fetch(`/api/term/${id}/resize`, {method:"POST",
         body: JSON.stringify({cols: a.term.cols, rows: a.term.rows})}).catch(()=>{});
+      ubicarBotones();
     });
   }
   render();
@@ -1497,54 +1744,78 @@ async function pintarVer(){
 }
 
 /* ---------------- render ---------------- */
+// Un ítem de la barra. `o` es la sesión (pestaña o de afuera) y `attrs` los data-* que
+// definen qué pasa al hacerle click (abrir pestaña / enfocar Terminal / ver read-only).
+// Botones: 📌 fijar arriba · ✏️ ponerle nombre propio · ✕ cerrar (solo pestañas).
+function itemHTML(o, attrs, opts){
+  opts = opts || {};
+  const sid = o.sid || "";
+  const acciones = sid ? `
+      <button class="acc fijar ${o.fija?"on":""}" data-fijar="${esc(sid)}"
+        title="${o.fija?"Soltar de arriba":"Fijar arriba"}">${o.fija?"📌":"📍"}</button>
+      <button class="acc" data-renombrar="${esc(sid)}" data-nombre="${esc(o.titulo)}"
+        title="Ponerle un nombre">✏️</button>` : "";
+  return `
+      <div class="item ${opts.activo?"activo":""} ${opts.fijada?"fijada":""}" ${attrs}
+           data-sid="${esc(sid)}" ${opts.fijada?'draggable="true"':""}>
+        <div class="fila"><span class="dot ${o.estado}"></span>
+          <span class="tit ${o.renombrada?"propio":""}">${esc(o.titulo)}</span>
+          <span style="color:var(--gris);font-size:10px">${hace(o.hace_seg)}</span>
+          ${acciones}${opts.botonX||""}</div>
+        <div class="sub">${esc(o.proyecto)}</div>
+        ${o.ultimo_txt&&!opts.sinSnippet?'<div class="snippet">'+esc(o.ultimo_quien)+": "+esc(o.ultimo_txt)+"</div>":""}
+      </div>`;
+}
+
+// Los data-* de cada tipo de sesión, para poder dibujarla igual en su sección o arriba.
+function attrsDe(o){
+  if(o.__tab) return `data-tab="${o.id}"`;
+  if(o.tipo === "terminal" && o.viva) return `data-tty="${esc(o.tty)}"`;
+  return `data-ver="${esc(o.id)}" data-vtit="${esc(o.titulo)}" data-viva="${o.viva?1:0}"`;
+}
+
 function render(){
   // barra lateral
+  const tabs = estado.tabs.map(t => Object.assign({__tab:true}, t));
   const vivasAfuera = estado.afuera.filter(s => s.viva);
   const term = vivasAfuera.filter(s => s.tipo === "terminal");
   const autos = vivasAfuera.filter(s => s.tipo !== "terminal");
   const muertas = estado.afuera.filter(s => !s.viva).length;
+  const esActiva = o => o.__tab ? o.id===activa : ("ver:"+o.id)===activa;
+  const botonX = t => `<button class="x ${confirmarX===t.id?"confirmar":""}" data-x="${t.id}"
+            title="${confirmarX===t.id?"Click de nuevo: mata la sesión":"Cerrar"}">✕</button>`;
   let h = "";
-  if(estado.tabs.length){
-    h += '<div class="seccion">En esta app</div>' + estado.tabs.map(t => `
-      <div class="item ${t.id===activa?"activo":""}" data-tab="${t.id}">
-        <div class="fila"><span class="dot ${t.estado}"></span>
-          <span class="tit">${esc(t.titulo)}</span>
-          <span style="color:var(--gris);font-size:10px">${hace(t.hace_seg)}</span>
-          <button class="x ${confirmarX===t.id?"confirmar":""}" data-x="${t.id}"
-            title="${confirmarX===t.id?"Click de nuevo: mata la sesión":"Cerrar"}">✕</button></div>
-        <div class="sub">${esc(t.proyecto)}</div>
-        ${t.ultimo_txt?'<div class="snippet">'+esc(t.ultimo_quien)+": "+esc(t.ultimo_txt)+"</div>":""}
-      </div>`).join("");
+
+  // ── FIJADAS: salen de su sección y suben al tope, en el orden que las dejaste ──
+  const fijadas = tabs.concat(estado.afuera).filter(o => o.fija);
+  fijadas.sort((a,b) => (a.orden==null?9999:a.orden) - (b.orden==null?9999:b.orden));
+  const fijos = new Set(fijadas.map(o => o.sid));
+  if(fijadas.length){
+    h += '<div class="seccion">📌 Fijadas</div>' + fijadas.map(o =>
+      itemHTML(o, attrsDe(o), {activo:esActiva(o), fijada:true, sinSnippet:true,
+                               botonX: o.__tab ? botonX(o) : ""})).join("");
   }
-  if(term.length){
-    h += '<div class="seccion">En Terminal (afuera)</div>' + term.map(s => `
-      <div class="item" data-tty="${esc(s.tty)}">
-        <div class="fila"><span class="dot ${s.estado}"></span>
-          <span class="tit">${esc(s.titulo)}</span>
-          <span style="color:var(--gris);font-size:10px">${hace(s.hace_seg)}</span></div>
-        <div class="sub">${esc(s.proyecto)}</div>
-        ${s.ultimo_txt?'<div class="snippet">'+esc(s.ultimo_quien)+": "+esc(s.ultimo_txt)+"</div>":""}
-      </div>`).join("");
+  const libres = a => a.filter(o => !fijos.has(o.sid));
+
+  const tabsL = libres(tabs);
+  if(tabsL.length){
+    h += '<div class="seccion">En esta app</div>' +
+      tabsL.map(t => itemHTML(t, attrsDe(t), {activo:esActiva(t), botonX:botonX(t)})).join("");
   }
-  if(autos.length){
-    h += '<div class="seccion">Automáticas</div>' + autos.map(s => `
-      <div class="item ${("ver:"+s.id)===activa?"activo":""}" data-ver="${esc(s.id)}" data-vtit="${esc(s.titulo)}" data-viva="1">
-        <div class="fila"><span class="dot ${s.estado}"></span>
-          <span class="tit">${esc(s.titulo)}</span>
-          <span style="color:var(--gris);font-size:10px">${hace(s.hace_seg)}</span></div>
-        <div class="sub">${esc(s.proyecto)}</div>
-        ${s.ultimo_txt?'<div class="snippet">'+esc(s.ultimo_quien)+": "+esc(s.ultimo_txt)+"</div>":""}
-      </div>`).join("");
+  const termL = libres(term);
+  if(termL.length){
+    h += '<div class="seccion">En Terminal (afuera)</div>' +
+      termL.map(s => itemHTML(s, attrsDe(s), {})).join("");
   }
-  const term12 = estado.afuera.filter(s => !s.viva).slice(0, 12);
+  const autosL = libres(autos);
+  if(autosL.length){
+    h += '<div class="seccion">Automáticas</div>' +
+      autosL.map(s => itemHTML(s, attrsDe(s), {activo:esActiva(s)})).join("");
+  }
+  const term12 = libres(estado.afuera.filter(s => !s.viva)).slice(0, 12);
   if(term12.length){
-    h += '<div class="seccion">Terminadas hoy</div>' + term12.map(s => `
-      <div class="item ${("ver:"+s.id)===activa?"activo":""}" data-ver="${esc(s.id)}" data-vtit="${esc(s.titulo)}" data-viva="0">
-        <div class="fila"><span class="dot terminada"></span>
-          <span class="tit">${esc(s.titulo)}</span>
-          <span style="color:var(--gris);font-size:10px">${hace(s.hace_seg)}</span></div>
-        <div class="sub">${esc(s.proyecto)}</div>
-      </div>`).join("");
+    h += '<div class="seccion">Terminadas hoy</div>' +
+      term12.map(s => itemHTML(s, attrsDe(s), {activo:esActiva(s), sinSnippet:true})).join("");
   }
   $("#listas").innerHTML = h || '<div class="seccion">Sin sesiones vivas</div>';
   $("#pie").textContent = estado.tabs.length + " en la app · " +
@@ -1557,6 +1828,51 @@ function render(){
   micVisible();
 }
 
+/* ---------------- fijar / renombrar / reordenar ---------------- */
+async function guardarMeta(sid, campos){
+  try{
+    const r = await fetch(`/api/sesion/${sid}/meta`, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify(campos)});
+    const j = await r.json();
+    if(j.error) throw new Error(j.error);
+    await refrescar();          // el server ya es la fuente: se repinta con lo guardado
+  }catch(err){
+    $("#pie").textContent = "no pude guardar: " + err.message;
+  }
+}
+
+// El drag vive contra el DOM, pero render() reescribe #listas entero cada 4 s: si el
+// refresco cae en medio del arrastre, el ítem se evapora en la mano. Por eso se pausa.
+let arrastrando = null, pausaRefresco = false;
+
+document.addEventListener("dragstart", e => {
+  const it = e.target.closest(".item.fijada");
+  if(!it) return;
+  arrastrando = it.dataset.sid; pausaRefresco = true;
+  it.classList.add("arrastrando");
+  e.dataTransfer.effectAllowed = "move";
+});
+document.addEventListener("dragover", e => {
+  if(!arrastrando) return;
+  const sobre = e.target.closest(".item.fijada");
+  if(!sobre || sobre.dataset.sid === arrastrando) return;
+  e.preventDefault();
+  const caja = sobre.getBoundingClientRect();
+  const arriba = (e.clientY - caja.top) < caja.height / 2;
+  const yo = document.querySelector(`.item.fijada[data-sid="${arrastrando}"]`);
+  if(yo) sobre.parentNode.insertBefore(yo, arriba ? sobre : sobre.nextSibling);
+});
+document.addEventListener("drop", e => { if(arrastrando) e.preventDefault(); });
+document.addEventListener("dragend", async () => {
+  if(!arrastrando) return;
+  arrastrando = null;
+  document.querySelectorAll(".arrastrando").forEach(n => n.classList.remove("arrastrando"));
+  const ids = [...document.querySelectorAll(".item.fijada")].map(n => n.dataset.sid);
+  for(let i = 0; i < ids.length; i++) await guardarMeta(ids[i], {orden: i});
+  pausaRefresco = false;
+});
+
 /* ---------------- eventos ---------------- */
 document.addEventListener("click", e => {
   if(e.target.closest("#btn-menu")){
@@ -1564,6 +1880,20 @@ document.addEventListener("click", e => {
     return;
   }
   if(e.target.id === "velo"){ menu(false); return; }
+  const fij = e.target.closest("[data-fijar]");
+  if(fij){
+    e.stopPropagation();
+    guardarMeta(fij.dataset.fijar, {fija: !fij.classList.contains("on")});
+    return;
+  }
+  const ren = e.target.closest("[data-renombrar]");
+  if(ren){
+    e.stopPropagation();
+    const actual = ren.dataset.nombre || "";
+    const n = prompt("Nombre para esta sesión (vacío = volver al automático):", actual);
+    if(n !== null) guardarMeta(ren.dataset.renombrar, {nombre: n});
+    return;
+  }
   const x = e.target.closest(".x");
   if(x){
     e.stopPropagation();
@@ -1581,7 +1911,9 @@ document.addEventListener("click", e => {
   if(item){
     if(item.dataset.tab){ abrirTab(item.dataset.tab); return; }
     if(item.dataset.tty){
-      fetch("/api/abrir?tty=" + item.dataset.tty, {method:"POST"});
+      fetch("/api/abrir?tty=" + item.dataset.tty, {method:"POST"})
+        .then(r => r.json()).then(j => { if(j && !j.ok) aviso(j.msg || "No pude abrir esa Terminal", true); })
+        .catch(() => aviso("No pude abrir esa Terminal", true));
       return;
     }
     if(item.dataset.ver){ abrirVer(item.dataset.ver, item.dataset.vtit, item.dataset.viva === "1"); return; }
@@ -1600,29 +1932,40 @@ document.addEventListener("click", e => {
 
 window.addEventListener("resize", () => {
   const a = abiertas[activa];
-  if(a) a.fit.fit();
+  if(a){ a.fit.fit(); requestAnimationFrame(ubicarBotones); }
 });
 
 /* ---- barra de escritura del teléfono ---- */
-function mandar(raw){
+let micMParar = null;   // lo define el bloque del mic móvil (si hay Web Speech API)
+function mandar(raw, siFalla){
   if(!activa) return;
   fetch(`/api/term/${activa}/input`, {
     method:"POST", body: JSON.stringify({d: b64de(raw)})
-  }).catch(()=>{});
+  }).then(r => r.json()).then(j => {
+    // el server contesta ok:false si el pty ya no acepta escritura (sesión
+    // terminada): sin esto el texto se perdía MUDO
+    if(j && j.ok === false){ avisoPty(); if(siFalla) siFalla(); }
+  }).catch(() => {
+    aviso("No se envió — sin conexión con el server", true);
+    if(siFalla) siFalla();
+  });
 }
 function enviarTexto(){
+  if(micMParar) micMParar();   // si estabas dictando (mic de Chrome), corta y deja el texto final
   const ta = $("#texto-m");
   // El dictado de iOS escribe texto "provisorio" (marked text) que recién se
   // confirma al cerrar el dictado. Si se lee ta.value en el medio, se manda
-  // una hipótesis vieja y el resto se pierde (mensajes truncados).
+  // una hipótesis vieja y el resto se pierde (mensajes truncados, 14-ago-2026).
   // blur() obliga a iOS a confirmar lo dictado; el valor se lee un tick después.
   ta.blur();
   setTimeout(() => {
     if(!ta.value.trim()){ ta.focus(); return; }
-    // bracketed paste: el texto entra entero (con saltos de línea incluidos)
-    // y el \r final lo envía — igual que pegar y dar Enter
-    mandar("\x1b[200~" + ta.value + "\x1b[201~\r");
+    const valor = ta.value;
     ta.value = ""; ta.style.height = "auto";
+    // bracketed paste: el texto entra entero (con saltos de línea incluidos)
+    // y el \r final lo envía — igual que pegar y dar Enter. Si falla, el
+    // texto vuelve al cajón en vez de perderse.
+    mandar("\x1b[200~" + valor + "\x1b[201~\r", () => { ta.value = valor; });
     ta.focus();   // mejor esfuerzo por dejar el teclado abierto, como antes
   }, 150);
 }
@@ -1657,21 +2000,26 @@ if(MOVIL){
     if(!activa || !abiertas[activa]){ aviso("Abrí una sesión primero", true); return; }
     aviso(files.length === 1 ? "Subiendo " + files[0].name + "…"
                              : "Subiendo " + files.length + " archivos…");
-    let pegar = "";
+    let pegar = "", fallaron = [];
     for(const f of files){
       try{
         const r = await fetch("/api/subir?nombre=" + encodeURIComponent(f.name),
                               {method:"POST", body:f});
         const j = await r.json();
         if(j.ruta) pegar += '"' + j.ruta + '" ';
-      }catch(err){}
+        else fallaron.push(f.name);
+      }catch(err){ fallaron.push(f.name); }
     }
     $("#file-m").value = "";
-    if(pegar){
+    if(pegar && !fallaron.length){
       mandar("\x1b[200~" + pegar + "\x1b[201~");
       aviso("Listo: la ruta quedó en la sesión — agregá texto si querés y mandá ⏎");
+    } else if(pegar){
+      mandar("\x1b[200~" + pegar + "\x1b[201~");
+      aviso("Subí " + (files.length - fallaron.length) + " de " + files.length +
+            " — falló: " + fallaron.join(", "), true);
     } else {
-      aviso("No pude subir el archivo", true);
+      aviso("No pude subir " + (files.length === 1 ? "el archivo" : "ningún archivo"), true);
     }
   });
   // teclado de iOS: la página se achica al alto visible real para que la
@@ -1696,14 +2044,16 @@ if(MOVIL){
    revisás y lo mandás con ⏎ o con el botón de enviar de al lado (mismo
    comportamiento que el dictado de macOS).
    Chrome sobre 127.0.0.1 es "secure context", así que la API anda en la
-   ventana de Cacho.app; en el teléfono el botón no aparece (el teclado de
-   iOS ya trae su micrófono y dicta en la barra de abajo). */
+   ventana de Cacho.app. En el teléfono hay un mic propio en la barra de
+   abajo (#btn-mic-m, más adelante), que dicta al cajón de texto. */
 const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-let mic = null, micActivo = false, micFinal = "", micTab = null;
+let mic = null, micActivo = false, micFinal = "", micInterim = "", micTab = null;
 function micVisible(){
   const hay = !MOVIL && !!activa && !!abiertas[activa];
   const b = $("#btn-mic");
-  if(b) b.classList.toggle("ver", hay && !!SR);
+  // grabando queda visible SIEMPRE (aunque cambies a un visor): si se
+  // escondiera no habría forma de cortar el dictado
+  if(b) b.classList.toggle("ver", (hay && !!SR) || micActivo);
   const e = $("#btn-enviar-esc");
   if(e) e.classList.toggle("ver", hay);
 }
@@ -1718,18 +2068,42 @@ function micAviso(txt){
   el.classList.add("ver");
   setTimeout(() => { if(!micActivo) el.classList.remove("ver"); }, 5000);
 }
-function micParar(){
+function micParar(despues){
+  // BUG histórico (14-ago-2026): acá se usaba SOLO micFinal, pero Chrome
+  // recién "confirma" lo hablado tras una pausa — si parabas (botón, ➤ o
+  // Enter) sin pausar, TODO seguía siendo hipótesis (interim) y se tiraba:
+  // "grabo, aprieto Enter y se borra todo". Ahora la hipótesis cuenta.
   micActivo = false;
   $("#btn-mic").classList.remove("grabando");
-  if(mic) try{ mic.stop(); }catch(e){}
-  const texto = micFinal.trim();
-  micFinal = ""; $("#mic-live").classList.remove("ver");
-  if(texto && micTab && abiertas[micTab]){
-    fetch(`/api/term/${micTab}/input`, {method:"POST",
-      body: JSON.stringify({d: b64de("\x1b[200~" + texto + "\x1b[201~")})}).catch(()=>{});
-    abiertas[micTab].term.focus();
+  if(mic){
+    mic.onresult = null;   // lo pendiente ya lo tomamos acá: sin duplicados
+    try{ mic.stop(); }catch(e){}
   }
+  const texto = (micFinal + micInterim).trim();
+  micFinal = ""; micInterim = "";
+  $("#mic-live").classList.remove("ver");
+  const tab = micTab;
   micTab = null;
+  if(texto && tab && abiertas[tab]){
+    fetch(`/api/term/${tab}/input`, {method:"POST",
+      body: JSON.stringify({d: b64de("\x1b[200~" + texto + "\x1b[201~")})})
+      .then(r => r.json()).then(j => {
+        if(j && j.ok === false){
+          try{ navigator.clipboard.writeText(texto); }catch(e){}
+          aviso("La sesión ya no acepta escritura — lo dictado quedó copiado al portapapeles", true);
+          return;
+        }
+        // el Enter (si lo hay) va DESPUÉS de que el TUI digirió el paste
+        if(despues) setTimeout(despues, 250);
+      })
+      .catch(() => {   // que lo dictado no se pierda mudo
+        try{ navigator.clipboard.writeText(texto); }catch(e){}
+        aviso("Falló el pegado del dictado — quedó copiado al portapapeles", true);
+      });
+    abiertas[tab].term.focus();
+  } else if(despues){
+    despues();
+  }
 }
 function micArrancar(){
   if(!activa || !abiertas[activa]) return;
@@ -1743,6 +2117,7 @@ function micArrancar(){
       if(r.isFinal) micFinal += r[0].transcript + " ";
       else interim += r[0].transcript;
     }
+    micInterim = interim;   // la hipótesis vigente: micParar() la usa al cortar
     micPintar(interim);
   };
   mic.onerror = e => {
@@ -1756,7 +2131,7 @@ function micArrancar(){
   // Chrome corta solo tras unos segundos de silencio: mientras el botón siga
   // encendido, se rearranca y la grabación continúa sin perder lo dictado
   mic.onend = () => { if(micActivo) try{ mic.start(); }catch(e){} };
-  micActivo = true; micFinal = "";
+  micActivo = true; micFinal = ""; micInterim = "";
   $("#btn-mic").classList.add("grabando");
   try{ mic.start(); }catch(e){ micActivo = false; $("#btn-mic").classList.remove("grabando"); }
 }
@@ -1767,13 +2142,103 @@ $("#btn-mic").addEventListener("click", () => micActivo ? micParar() : micArranc
 // flecha). Si estabas grabando, primero corta y pega lo dictado; el Enter
 // va un toque después, para que el TUI de claude digiera el paste.
 $("#btn-enviar-esc").addEventListener("click", () => {
-  const id = micTab || activa;
-  if(!id || !abiertas[id]) return;
-  const demora = micActivo ? 350 : 0;
-  if(micActivo) micParar();
-  setTimeout(() => fetch(`/api/term/${id}/input`, {method:"POST",
-    body: JSON.stringify({d: b64de("\r")})}).catch(()=>{}), demora);
+  const id = activa;   // SIEMPRE la sesión visible (si dictaste en otra, el
+  if(!id || !abiertas[id]) return;   // paste va allá pero el Enter no)
+  const enter = () => fetch(`/api/term/${id}/input`, {method:"POST",
+    body: JSON.stringify({d: b64de("\r")})})
+    .catch(() => aviso("No se envió el Enter — probá de nuevo", true));
+  // si estabas dictando, micParar pega lo dictado (incluida la hipótesis)
+  // y recién DESPUÉS de que el paste llegó dispara el Enter
+  if(micActivo) micParar(enter); else enter();
 });
+
+/* ---- mic de la barra del teléfono: dicta al cajón de texto ----
+   A diferencia del mic de escritorio (que pega directo en la terminal), acá
+   el texto cae en #texto-m: lo revisás y lo mandás con ➤, igual que si lo
+   hubieras tipeado. OJO: sobre una IP de Tailscale por http:// Safari
+   puede negar el micrófono porque no es "secure context" — en ese caso el
+   botón avisa y queda el mic del teclado de iOS, que dicta en el mismo cajón. */
+if(MOVIL){
+  const bm = $("#btn-mic-m");
+  if(!SR){
+    bm.style.display = "none";   // sin Web Speech API: queda el mic del teclado
+  } else {
+    const ta = $("#texto-m");
+    let micM = null, micMActivo = false, base = "", fin = "", interimM = "";
+    const pintar = interim => {
+      ta.value = base + fin + (interim || "");
+      ta.style.height = "auto";
+      ta.style.height = Math.min(ta.scrollHeight, 120) + "px";
+    };
+    micMParar = () => {
+      if(!micMActivo) return;
+      micMActivo = false;
+      bm.classList.remove("grabando");
+      if(micM){
+        micM.onresult = null;   // lo pendiente lo tomamos acá: sin duplicados
+        try{ micM.stop(); }catch(e){}
+      }
+      // BUG histórico (14-ago-2026): acá se hacía pintar("") con SOLO lo
+      // confirmado — si parabas (➤ o Enter) sin pausar antes, la hipótesis
+      // (casi todo lo hablado) se borraba del cajón. Ahora se conserva.
+      if(interimM){ fin += interimM + " "; interimM = ""; }
+      pintar("");   // queda TODO lo dictado en el cajón; se manda con ➤
+    };
+    const arrancar = () => {
+      base = ta.value ? ta.value.replace(/\s+$/, "") + " " : "";
+      fin = ""; interimM = "";
+      micM = new SR();
+      micM.lang = "es-UY"; micM.continuous = true; micM.interimResults = true;
+      micM.onresult = e => {
+        let interim = "";
+        for(let i = e.resultIndex; i < e.results.length; i++){
+          const r = e.results[i];
+          if(r.isFinal) fin += r[0].transcript + " ";
+          else interim += r[0].transcript;
+        }
+        interimM = interim;   // la hipótesis vigente: micMParar la conserva
+        pintar(interim);
+      };
+      micM.onerror = e => {
+        if(e.error === "not-allowed" || e.error === "service-not-allowed"){
+          micMParar();
+          aviso("Safari no dio permiso de micrófono — usá el mic del teclado de iOS", true);
+        }
+        // "no-speech"/"aborted": el onend rearranca solo mientras siga activo
+      };
+      micM.onend = () => { if(micMActivo) try{ micM.start(); }catch(e){} };
+      micMActivo = true;
+      bm.classList.add("grabando");
+      try{ micM.start(); }catch(e){
+        micMActivo = false; bm.classList.remove("grabando");
+        aviso("No pude arrancar el dictado en este navegador", true);
+      }
+    };
+    bm.addEventListener("click", () => micMActivo ? micMParar() : arrancar());
+  }
+}
+
+/* ---- recarga automática tras reinicio del server ----
+   Reiniciar el server NO recarga esta ventana (open -a solo la enfoca), así
+   que sin esto quedaba corriendo el JS viejo para siempre. El server manda
+   su BOOT_ID en /api/ping; si cambia, la página se recarga sola. Mientras
+   el server está caído el fetch falla y no pasa nada. */
+let bootVisto = null;
+function chequearBoot(){
+  fetch("/api/ping").then(r => r.json()).then(j => {
+    if(!j.boot) return;
+    if(bootVisto === null){ bootVisto = j.boot; return; }
+    // no recargar si hay algo a medio escribir: dictado activo (escritorio
+    // o teléfono) o texto sin mandar en el cajón del teléfono — la recarga
+    // se lo llevaba puesto; se reintenta solo en el próximo chequeo
+    const aMedias = micActivo ||
+      $("#btn-mic-m").classList.contains("grabando") ||
+      (MOVIL && $("#texto-m").value.trim() !== "");
+    if(j.boot !== bootVisto && !aMedias) location.reload();
+  }).catch(()=>{});
+}
+chequearBoot();
+setInterval(chequearBoot, 15000);
 
 /* ---- drag & drop de archivos: guardar y pegar la ruta en la terminal ---- */
 ["dragover", "dragenter"].forEach(ev =>
@@ -1811,6 +2276,7 @@ document.addEventListener("drop", async e => {
 });
 
 async function refrescar(){
+  if(pausaRefresco) return;   // hay un arrastre en curso: no repintar la lista debajo
   try{
     const r = await fetch("/api/estado");
     const j = await r.json();
