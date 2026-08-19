@@ -52,10 +52,21 @@ if ! curl -s -m 1 "\$URL/api/ping" > /dev/null; then
   done
 fi
 
-# El server exige PIN (~/.cacho_pin, lo genera él al arrancar); acá va en la
-# URL para que la ventana local entre sola. Server viejo sin PIN: lo ignora.
+# El server exige PIN (~/.cacho_pin, lo genera él al arrancar) y la ventana local
+# tiene que entrar sola. OJO con CÓMO entra:
+#   · El PIN NO viaja como argumento. Se le pasa al server por la ENTRADA ESTÁNDAR
+#     de curl, porque todo lo que va en una línea de comandos lo lee cualquier
+#     proceso de la máquina con un `ps`.
+#   · Lo que sí termina en la URL de Chrome es un TICKET de un solo uso que vence
+#     en 60 s. Antes iba el PIN ahí, y quedaba a la vista en `ps` todas las horas
+#     que la ventana estuviera abierta.
+# Server viejo (sin /api/ticket): se cae al PIN en la URL, como antes.
 PIN=\$(cat "\$HOME/.cacho_pin" 2>/dev/null || true)
-[ -n "\$PIN" ] && URL="\$URL/?pin=\$PIN"
+if [ -n "\$PIN" ]; then
+  TICKET=\$(printf 'pin=%s' "\$PIN" | curl -s -m 3 -X POST --data-binary @- \\
+            "\$URL/api/ticket" | sed -n 's/.*"t": *"\\([^"]*\\)".*/\\1/p')
+  if [ -n "\$TICKET" ]; then URL="\$URL/?t=\$TICKET"; else URL="\$URL/?pin=\$PIN"; fi
+fi
 
 # 2. si ya hay una ventana de la app, traerla al frente EN SERIO; si no, abrirla.
 #    (15-ago-2026) La versión vieja matcheaba por título "Cacho" (cualquier
