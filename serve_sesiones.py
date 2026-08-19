@@ -9,20 +9,37 @@ alrededor).
 
 Escucha SOLO en 127.0.0.1. OJO: si usás Tailscale, eso NO alcanza para
 aislarlo del tailnet — tailscaled en modo userspace reenvía a localhost las
-conexiones entrantes de tus otros dispositivos. O sea: desde el teléfono o
-la laptop por Tailscale este server SÍ se ve. Por eso TODA request (menos
-/static, /api/ping y el ícono) exige un PIN: cookie `cacho_pin` o `?pin=`.
-El PIN vive en ~/.cacho_pin (se genera solo, por máquina); el lanzador de
-Cacho.app lo pasa en la URL, y desde el teléfono se tipea una vez (queda la
-cookie un año). Una terminal por red = control total de esta máquina: el PIN
-no es decorativo.
+conexiones entrantes de tus otros dispositivos. O sea: desde el teléfono o la
+laptop por Tailscale este server SÍ se ve. Una terminal alcanzable por red =
+control total de esa máquina, así que la puerta no es decorativa. Cómo está
+cerrada:
+
+  · Se entra UNA vez con el PIN de ~/.cacho_pin (se genera solo, por máquina; el
+    lanzador de Cacho.app lo pasa en la URL y el server redirige para sacarlo de
+    la barra). Acertarlo entrega un TOKEN de sesión de 256 bits, que es lo que
+    viaja después: el PIN no queda guardado en el navegador.
+  · El login está frenado: 8 PIN equivocados y esa IP queda afuera 1 min, 5, 15,
+    1 h. Se contesta al instante, sin dormir la request (dormirla no frena nada:
+    el atacante las lanza en paralelo). Los bloqueos quedan escritos en
+    ~/Library/Logs/cacho-seguridad.log.
+  · Estar adentro NO pasa por el freno: el token no se adivina. Por eso alguien
+    golpeando la puerta no deja afuera al dueño — que es lo que pasaba cuando la
+    cookie guardaba el PIN, porque por Tailscale todos los dispositivos llegan
+    con la misma IP de origen que localhost.
+  · Sin token no se ve NADA salvo /api/ping y el logo de la pantalla de login.
+  · Los .html de static/ se sirven en sandbox: son para mirar, no son código de
+    Cacho, y no pueden llamar a las APIs.
+
+Para echar a todos los dispositivos: borrar
+~/Library/Application Support/Cacho/sesiones_web.json (y cambiar el PIN si hace
+falta, que se relee en caliente: `echo 1234 > ~/.cacho_pin`).
 
 Uso:  python3 serve_sesiones.py            # http://127.0.0.1:8811
       CACHO_PORT=9000 python3 serve_sesiones.py   # otro puerto (tests)
 """
 import base64
 import fcntl
-import html
+import hmac
 import ipaddress
 import json
 import os
@@ -30,14 +47,16 @@ import re
 import signal
 import struct
 import subprocess
+import sys
 import termios
 import threading
 import time
 import uuid
 from datetime import datetime
+from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Empty, Queue
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 CARPETA_PROYECTOS = os.path.expanduser("~/Claude/Projects")
@@ -46,6 +65,7 @@ PORT = int(os.environ.get("CACHO_PORT", "8811"))
 BIND = "127.0.0.1"   # NO cambiar a 0.0.0.0: expondría terminales por red
 CHUNK = 256 * 1024   # bytes que se leen de cabeza/cola de cada transcript
 TOPE_BUFFER = 2_000_000  # scrollback por terminal; es lo que se re-manda al reconectar
+COALESCE_MAX = 64 * 1024  # tope al juntar trozos del PTY en un solo evento SSE (ver _stream)
 
 # Identidad de ESTE arranque del server. La página lo compara contra /api/ping
 # y se recarga sola si cambió: reiniciar el server NO recarga las ventanas de
@@ -68,13 +88,247 @@ def _cargar_pin():
         pass
     import secrets
     pin = "".join(secrets.choice("0123456789") for _ in range(6))
-    with open(PIN_PATH, "w") as fh:
+    # 0600 desde el os.open, NO con un chmod después: entre el open y el chmod el
+    # archivo existe con los permisos del umask (habitualmente legible por todos) y
+    # ahí está la llave de la máquina. Es una ventana chica, pero es evitable.
+    fd = os.open(PIN_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
         fh.write(pin + "\n")
-    os.chmod(PIN_PATH, 0o600)
     return pin
 
 
 PIN = _cargar_pin()
+
+# El PIN se RELEE del archivo cuando cambia. Antes se leía una sola vez al arrancar:
+# cambiarlo obligaba a reiniciar el server, y reiniciar el server mata las pestañas
+# vivas. Ahora alcanza con `echo 1234 > ~/.cacho_pin` y rige en la request siguiente.
+# Cacheado por mtime: no es un open() por request.
+_pin_cache = {"mtime": 0.0, "pin": PIN}
+_PIN_LOCK = threading.Lock()
+
+
+def _pin_actual():
+    try:
+        m = os.path.getmtime(PIN_PATH)
+    except OSError:
+        return _pin_cache["pin"]
+    with _PIN_LOCK:
+        if m != _pin_cache["mtime"]:
+            try:
+                with open(PIN_PATH) as fh:
+                    nuevo = fh.read().strip()
+                if nuevo:
+                    _pin_cache.update(mtime=m, pin=nuevo)
+            except OSError:
+                pass
+        return _pin_cache["pin"]
+
+
+# ─── Freno anti fuerza bruta ───────────────────────────────────────────────────
+# Acertar el PIN no es "ver la app": es una terminal con control total de esta
+# máquina. Y el PIN es corto a propósito (se tipea en el celular), así que el
+# espacio de búsqueda es chico y lo único que lo defiende es este freno.
+#
+# La primera versión dormía la request que fallaba. NO SIRVE, y está medido
+# (16-ago-2026): el atacante abre 60 conexiones a la vez y las esperas corren en
+# paralelo → 2 intentos/s sostenidos, o sea los 10.000 PIN de 4 dígitos en 1,4 h.
+# Encima cada request dormida ocupa un thread del server: el "freno" era también
+# la forma más barata de tumbarlo.
+#
+# Ahora: pasados unos pocos fallos se le CIERRA LA PUERTA a esa IP por un rato y
+# se contesta 429 al instante, sin dormir ni ocupar nada. El castigo escala con la
+# reincidencia, así que insistir sale cada vez más caro: 8 intentos por hora contra
+# 10.000 combinaciones son ~52 días de ataque continuo — y ruidoso, porque queda
+# escrito (ver _log_seguridad).
+BLOQUEO_TRAS = 8                       # fallos seguidos antes de cerrar la puerta
+ESCALADA = (60, 300, 900, 3600)        # cuánto dura el bloqueo, según reincidencia
+LOG_SEGURIDAD = os.path.expanduser("~/Library/Logs/cacho-seguridad.log")
+
+_FALLOS = {}          # ip -> {"n": fallos, "hasta": epoch, "castigos": int}
+_FALLOS_LOCK = threading.Lock()
+
+
+def _pin_igual(recibido, esperado=None):
+    """Comparación de tiempo constante: `==` corta en el primer carácter distinto
+    y ese tiempo delata cuántos dígitos acertaste."""
+    try:
+        return hmac.compare_digest(str(recibido).encode("utf-8", "replace"),
+                                   (esperado or _pin_actual()).encode())
+    except Exception as e:
+        print(f"⚠️ comparando el PIN se rompió algo (lo doy por incorrecto): {e}", file=sys.stderr)
+        return False
+
+
+def _log_seguridad(texto):
+    """Deja rastro de los intentos. El server no loguea NADA (log_message está
+    anulado a propósito, ensuciaba la consola), así que sin esto un ataque de
+    días sería completamente invisible."""
+    try:
+        os.makedirs(os.path.dirname(LOG_SEGURIDAD), exist_ok=True)
+        with open(LOG_SEGURIDAD, "a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now().isoformat(timespec='seconds')} {texto}\n")
+    except OSError:
+        pass
+
+
+def _bloqueado(ip):
+    """Segundos de bloqueo que le quedan a esa IP (0 = puede intentar)."""
+    with _FALLOS_LOCK:
+        d = _FALLOS.get(ip)
+        return max(0.0, d["hasta"] - time.time()) if d else 0.0
+
+
+def _fallo_pin(ip):
+    """Un PIN equivocado. Al octavo, la puerta se cierra por un rato."""
+    with _FALLOS_LOCK:
+        if len(_FALLOS) > 1000:        # purga de vencidos, que no crezca sin techo
+            ahora = time.time()
+            for k in [k for k, v in _FALLOS.items() if v["hasta"] < ahora]:
+                del _FALLOS[k]
+        d = _FALLOS.setdefault(ip, {"n": 0, "hasta": 0.0, "castigos": 0})
+        d["n"] += 1
+        if d["n"] < BLOQUEO_TRAS:
+            return
+        dur = ESCALADA[min(d["castigos"], len(ESCALADA) - 1)]
+        d.update(n=0, hasta=time.time() + dur, castigos=d["castigos"] + 1)
+    _log_seguridad(f"BLOQUEO {ip}: {BLOQUEO_TRAS} PIN equivocados seguidos "
+                   f"-> {dur}s de bloqueo (castigo #{d['castigos']})")
+
+
+def _acierto_pin(ip):
+    with _FALLOS_LOCK:
+        _FALLOS.pop(ip, None)
+
+
+# ─── Sesiones web: el PIN se tipea UNA vez, después manda un token ─────────────
+# Antes la cookie GUARDABA EL PIN: cada request lo traía, así que "estar adentro"
+# y "adivinar la llave" eran el mismo acto. Eso rompía el freno de arriba en el
+# caso que importa: por Tailscale (proxy userspace) TODOS los dispositivos llegan
+# con la misma IP de origen que localhost, así que un atacante bloqueando esa IP
+# dejaba afuera al dueño (verificado: con el PIN correcto contestaba 429).
+#
+# Ahora acertar el PIN entrega un TOKEN aleatorio de 256 bits. El token no se
+# adivina —no necesita freno y nunca frena a nadie— y el PIN, que es corto porque
+# se tipea en el celular, solo se usa en el login, que sí está frenado duro.
+# De regalo: el PIN deja de viajar en cada request y de quedar guardado en el
+# navegador del teléfono.
+SESION_DIR = os.path.expanduser("~/Library/Application Support/Cacho")
+SESIONES_FILE = os.path.join(SESION_DIR, "sesiones_web.json")
+SESION_MAX = 20                  # dispositivos recordados a la vez
+SESION_VIDA = 365 * 24 * 3600    # un año sin usarse y se cae solo
+
+_sesiones = {}        # token -> último uso (epoch)
+_SES_LOCK = threading.Lock()
+
+
+def _sesiones_guardar():
+    """Persistidas para que reiniciar el server NO obligue a re-tipear el PIN en
+    cada dispositivo (el server se reinicia seguido). 0600 desde el os.open."""
+    try:
+        os.makedirs(SESION_DIR, exist_ok=True)
+        tmp = SESIONES_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(_sesiones, fh)
+        os.replace(tmp, SESIONES_FILE)
+    except OSError as e:
+        # Sin persistir, el login vale hasta el próximo reinicio del server —
+        # que es seguido. Se ve como "Cacho me pide el PIN de nuevo" y no hay
+        # forma de adivinar por qué si no queda escrito.
+        _log_seguridad(f"no pude guardar sesiones_web.json ({e!r}): los "
+                       "dispositivos van a tener que re-tipear el PIN al reiniciar")
+
+
+def _sesiones_cargar():
+    global _sesiones
+    try:
+        with open(SESIONES_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        if isinstance(d, dict):
+            ahora = time.time()
+            _sesiones = {k: float(v) for k, v in d.items()
+                         if isinstance(k, str) and ahora - float(v) < SESION_VIDA}
+    except FileNotFoundError:
+        _sesiones = {}          # primera vez en esta máquina: normal
+    except Exception as e:
+        # Arrancar de cero acá ECHA A TODOS los dispositivos: hay que volver a
+        # tipear el PIN en el teléfono y en la laptop sin saber por qué. Que al
+        # menos quede escrito, que es lo único que lo explica después.
+        _sesiones = {}
+        _log_seguridad(f"sesiones_web.json ilegible ({e!r}): se cerró la sesión "
+                       "de TODOS los dispositivos; hay que re-tipear el PIN")
+
+
+def _sesion_nueva():
+    import secrets
+    tok = secrets.token_urlsafe(32)
+    with _SES_LOCK:
+        _sesiones[tok] = time.time()
+        sobran = len(_sesiones) - SESION_MAX
+        if sobran > 0:               # se van las más viejas
+            for k in sorted(_sesiones, key=_sesiones.get)[:sobran]:
+                del _sesiones[k]
+        _sesiones_guardar()
+    return tok
+
+
+def _sesion_valida(tok):
+    if not tok:
+        return False
+    with _SES_LOCK:
+        for k in _sesiones:
+            if hmac.compare_digest(k, tok):
+                _sesiones[k] = time.time()
+                return True
+    return False
+
+
+# ─── Tickets de un solo uso (para el lanzador de la app) ──────────────────────
+# El lanzador abría Chrome con `--app=http://…/?pin=1234`. Eso deja el PIN en la
+# LÍNEA DE COMANDOS de Chrome, que cualquier proceso de la máquina lee con `ps`
+# mientras la ventana viva — horas. Ahora el lanzador cambia el PIN (que le pasa
+# al server por stdin, no por argumento) por un ticket que vale 60 segundos y una
+# sola vez: lo que queda a la vista en `ps` es un papel ya quemado.
+TICKET_VIDA = 60
+_tickets = {}         # ticket -> vencimiento
+_TICKET_LOCK = threading.Lock()
+
+
+def _ticket_nuevo():
+    import secrets
+    tok = secrets.token_urlsafe(24)
+    ahora = time.time()
+    with _TICKET_LOCK:
+        for k in [k for k, v in _tickets.items() if v < ahora]:
+            del _tickets[k]
+        _tickets[tok] = ahora + TICKET_VIDA
+    return tok
+
+
+def _ticket_usar(tok):
+    """True si el ticket valía. Se quema en el acto: un solo uso."""
+    if not tok:
+        return False
+    ahora = time.time()
+    with _TICKET_LOCK:
+        for k in list(_tickets):
+            if _tickets[k] < ahora:
+                del _tickets[k]
+            elif hmac.compare_digest(k, tok):
+                del _tickets[k]
+                return True
+    return False
+
+
+def _sesiones_borrar_todas():
+    """Echa a todos los dispositivos (para cuando algo huele mal)."""
+    with _SES_LOCK:
+        _sesiones.clear()
+        _sesiones_guardar()
+
+
+_sesiones_cargar()
+
 
 # ---------------------------------------------------------------------------
 # Parseo de transcripts (~/.claude/projects/*/<uuid>.jsonl)
@@ -119,7 +373,8 @@ def _texto_de(content):
 def _parse_linea(line):
     try:
         return json.loads(line)
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ línea ilegible en un .jsonl de sesión (la salteo): {e}", file=sys.stderr)
         return None
 
 
@@ -258,11 +513,44 @@ def _limpiar_multilinea(texto, tope=6000):
     return texto[:tope] + ("…" if len(texto) > tope else "")
 
 
+_cache_conv = {}
+_conv_lock = threading.Lock()
+
+
 def _leer_conversacion(path, max_msgs=150):
     """Conversación de un transcript para el visor de solo-lectura.
-    Lee la cola del archivo (hasta 1 MB): alcanza para ver qué hizo la corrida."""
+
+    Lee la COLA del archivo. Cuánta cola NO puede ser fija: los transcripts largos
+    traen líneas sueltas de varios MB (los `file-history-snapshot`), así que con el
+    1 MB de antes una sesión de 40 MB mostraba TRES mensajes y parecía vacía
+    (medido 16-ago-2026: 44 MB → 3 mensajes). Ahora la ventana se agranda hasta
+    juntar conversación de verdad. El resultado se cachea por (mtime, tamaño):
+    el visor se repinta cada 4 s y una sesión terminada ya no cambia nunca."""
     st = os.stat(path)
-    TOPE = 1024 * 1024
+    clave = (path, st.st_mtime, st.st_size)
+    with _conv_lock:
+        hit = _cache_conv.get(path)
+        if hit and hit[0] == clave:
+            return hit[1]
+
+    titulo, items, recortado = "", [], False
+    for tope in (1024 * 1024, 8 * 1024 * 1024, 32 * 1024 * 1024):
+        titulo, items = _parsear_cola(path, st, tope)
+        recortado = st.st_size > tope
+        if len(items) >= 12 or not recortado:
+            break
+    if len(items) > max_msgs:
+        items = items[-max_msgs:]
+    salida = {"titulo": titulo, "items": items, "mtime": st.st_mtime,
+              "recortado": recortado}
+    with _conv_lock:
+        if len(_cache_conv) > 40:
+            _cache_conv.clear()
+        _cache_conv[path] = (clave, salida)
+    return salida
+
+
+def _parsear_cola(path, st, TOPE):
     with open(path, "rb") as fh:
         if st.st_size > TOPE:
             fh.seek(st.st_size - TOPE)
@@ -296,10 +584,7 @@ def _leer_conversacion(path, max_msgs=150):
                 items[-1]["ts"] = ts
             else:
                 items.append({"q": "Claude", "t": nombres, "ts": ts, "tool": True})
-    if len(items) > max_msgs:
-        items = items[-max_msgs:]
-    return {"titulo": titulo, "items": items, "mtime": st.st_mtime,
-            "recortado": st.st_size > TOPE}
+    return titulo, items
 
 
 def _proyecto_lindo(cwd):
@@ -316,7 +601,8 @@ def _proyecto_lindo(cwd):
 def _iso_a_epoch(ts):
     try:
         return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ timestamp raro en sesión ({ts!r}), lo tomo como 0: {e}", file=sys.stderr)
         return 0
 
 
@@ -329,13 +615,22 @@ _proc_cache = {}  # pid -> {tty, cwd, start}; tty/cwd/start no cambian en vida d
 
 def procesos_claude(ttys_excluidos):
     try:
+        # timeout en los tres: sin él, un `lsof` colgado (pasa con volúmenes de red
+        # dormidos) se lleva puesto el thread que atiende /api/estado y la barra
+        # lateral queda muda sin decir por qué
         pids = {int(p) for p in subprocess.run(
-            ["pgrep", "-x", "claude"], capture_output=True, text=True).stdout.split()}
-    except Exception:
+            ["pgrep", "-x", "claude"], capture_output=True, text=True,
+            timeout=5).stdout.split()}
+    except Exception as e:
+        print(f"⚠️ pgrep de procesos claude falló (la barra lateral queda sin externos): {e}", file=sys.stderr)
         return []
     for pid in list(_proc_cache):
+        # pop y no `del`: /api/estado la piden varios clientes a la vez (cada
+        # pestaña refresca cada 4 s) y dos threads acá adentro con el mismo pid
+        # muerto hacían que el segundo se comiera un KeyError -> 500 y la barra
+        # lateral muda ese ciclo, sin explicación.
         if pid not in pids:
-            del _proc_cache[pid]
+            _proc_cache.pop(pid, None)
     procs = []
     for pid in pids:
         info = _proc_cache.get(pid)
@@ -343,14 +638,14 @@ def procesos_claude(ttys_excluidos):
             try:
                 salida = subprocess.run(
                     ["ps", "-o", "tty=,lstart=", "-p", str(pid)],
-                    capture_output=True, text=True).stdout.strip()
+                    capture_output=True, text=True, timeout=5).stdout.strip()
                 if not salida:
                     continue
                 tty, lstart = salida.split(None, 1)
                 start = time.mktime(time.strptime(lstart.strip(),
                                                   "%a %b %d %H:%M:%S %Y"))
                 lsof = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
-                                      capture_output=True, text=True).stdout
+                                      capture_output=True, text=True, timeout=5).stdout
                 cwd = ""
                 for line in lsof.splitlines():
                     if line.startswith("n"):
@@ -358,7 +653,8 @@ def procesos_claude(ttys_excluidos):
                         break
                 info = {"tty": tty, "cwd": cwd, "start": start}
                 _proc_cache[pid] = info
-            except Exception:
+            except Exception as e:
+                print(f"⚠️ no pude leer ps/lsof del proceso claude {pid} (lo salteo): {e}", file=sys.stderr)
                 continue
         if info["tty"] in ttys_excluidos:
             continue  # es una pestaña nuestra
@@ -384,7 +680,8 @@ def _modelo_preferido():
     try:
         with open(MODELO_PATH) as f:
             modelo = f.read().strip()
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ no pude leer el modelo preferido ({MODELO_PATH}), uso el default: {e}", file=sys.stderr)
         return ""
     return modelo if _MODELO_OK.match(modelo) else ""
 
@@ -432,8 +729,9 @@ class TermSession:
     def _auto_claude(self):
         time.sleep(0.9)  # que la shell levante el prompt
         # `claude` puede no estar en el PATH de la shell nueva (el instalador
-        # oficial lo deja en ~/.local/bin, p. ej. en la MacBook). Si tampoco
-        # está ahí, decirlo en pantalla en vez de dejar la pestaña negra.
+        # oficial lo deja en ~/.local/bin y el de npm en ~/.npm-global/bin, como
+        # en la MacBook). Si tampoco está ahí, decirlo en pantalla en vez de
+        # dejar la pestaña negra.
         # resume_id ya viene validado ([0-9a-f-]): seguro para la línea de comando
         claude = ("claude --resume " + self.resume_id) if self.resume_id else "claude"
         # Si existe ~/.cacho_modelo, las pestañas nuevas arrancan con ese modelo. Sirve
@@ -446,7 +744,7 @@ class TermSession:
             # (`claude-opus-5[1m]`) y zsh lo toma como glob → "no matches found".
             claude += " --model '" + modelo + "'"
         cmd = (
-            'PATH="$HOME/.local/bin:$HOME/.claude/local:'
+            'PATH="$HOME/.local/bin:$HOME/.claude/local:$HOME/.npm-global/bin:'
             '/opt/homebrew/bin:/usr/local/bin:$PATH"; '
             f"if command -v claude >/dev/null; then {claude}; "
             "else echo '>> Falta Claude Code en esta maquina. Instalalo con:'; "
@@ -505,13 +803,36 @@ class TermSession:
         except Exception:
             pass
         try:
+            self.proc.wait(timeout=1)   # cosecharlo acá: si no queda de zombi
+        except Exception:               # hasta que se cree otra pestaña
+            pass
+        try:
             os.close(self.master)
         except OSError:
             pass
 
+    def soltar(self):
+        """Suelta lo que ocupa una pestaña YA muerta: el scrollback (hasta 2 MB),
+        el fd del pty y el proceso sin cosechar. No mata nada — se llama justamente
+        cuando la shell ya murió sola (ver _cosechar_tabs)."""
+        try:
+            self.proc.wait(timeout=0)
+        except Exception:
+            pass
+        try:
+            os.close(self.master)
+        except OSError:
+            pass
+        with self.lock:
+            self.buf = bytearray()
+            for q in list(self.subs):
+                q.put(None)
+            self.subs = []
+
 
 TABS = {}          # id -> TermSession
 TABS_LOCK = threading.Lock()
+MAX_TABS = 30      # techo de pestañas simultáneas (ver /api/term/new)
 _mapeo_pid = {}    # transcript_id -> pid del proceso claude que le corresponde
 
 # ─── Metadatos por sesión: FIJADA / ORDEN / NOMBRE PROPIO ───
@@ -542,8 +863,14 @@ def _meta_leer():
                 with open(META_FILE, encoding="utf-8") as fh:
                     d = json.load(fh)
                 _meta_cache.update(mtime=m, datos=d if isinstance(d, dict) else {})
-            except Exception:
-                _meta_cache.update(mtime=m, datos={})   # archivo corrupto: no tumba Cacho
+            except Exception as e:
+                # archivo corrupto: no tumba Cacho, pero se pierden las fijadas y
+                # los nombres propios. Antes desaparecían en silencio y parecía un
+                # bug de la barra; ahora queda escrito. (Solo se loguea cuando el
+                # mtime cambia, así que no puede spamear cada 4 s.)
+                _meta_cache.update(mtime=m, datos={})
+                _log_seguridad(f"sesiones.json ilegible ({e!r}): se perdieron las "
+                               "sesiones fijadas y los nombres propios")
         return dict(_meta_cache["datos"])
 
 
@@ -557,8 +884,21 @@ def _meta_set(sid, campos):
                 datos = json.load(fh)
             if not isinstance(datos, dict):
                 datos = {}
-        except Exception:
-            pass
+        except FileNotFoundError:
+            pass                 # todavía no hay nada guardado: normal
+        except Exception as e:
+            # Acá NO alcanza con seguir de largo: arrancar de {} y guardar BORRA
+            # las fijadas y los nombres propios de todas las demás sesiones, en
+            # silencio y para siempre. Se aparta el archivo ilegible antes de
+            # pisarlo (así se puede recuperar a mano) y queda escrito.
+            datos = {}
+            try:
+                os.replace(META_FILE, META_FILE + ".corrupto")
+            except OSError:
+                pass
+            _log_seguridad(f"sesiones.json ilegible al guardar ({e!r}): se apartó "
+                           f"como {os.path.basename(META_FILE)}.corrupto y se "
+                           "empezó de cero (se pierden fijadas y nombres)")
         actual = dict(datos.get(sid) or {})
         for k, v in campos.items():
             if v is None:
@@ -571,7 +911,11 @@ def _meta_set(sid, campos):
             datos.pop(sid, None)             # sin nada que recordar, no dejar basura
         os.makedirs(META_DIR, exist_ok=True)
         tmp = META_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
+        # 0600 desde el os.open, igual que el resto del estado de Cacho: acá
+        # quedan los nombres que se le ponen a las sesiones, y eso dice en qué
+        # anda uno. Antes salía con el umask (legible por cualquier usuario).
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(datos, fh, ensure_ascii=False, indent=1)
         os.replace(tmp, META_FILE)
         _meta_cache.update(mtime=os.path.getmtime(META_FILE), datos=datos)
@@ -636,8 +980,28 @@ def _vincular_transcripts(tabs, parseadas):
     return usadas
 
 
+def _cosechar_tabs(ahora, gracia=900):
+    """Saca de TABS las pestañas cuya shell murió hace rato.
+
+    Antes NADA las sacaba: la única salida era la ✕ (que llama /kill). Una pestaña
+    donde escribías `exit`, o cuya shell se cayó, quedaba en memoria para siempre
+    con su scrollback (hasta 2 MB), su fd de pty y su proceso sin cosechar — y en
+    la barra, ocupando lugar como «terminada» eternamente.
+    La charla NO se pierde: al soltar la pestaña su transcript deja de estar
+    "usado" y reaparece abajo, en «Terminadas hoy», retomable con ⟳.
+    Los 15 minutos de gracia son para que se vea que terminó antes de que se vaya."""
+    with TABS_LOCK:
+        muertas = [(tid, t) for tid, t in TABS.items()
+                   if not t.viva and (ahora - t.last_out) > gracia]
+        for tid, _ in muertas:
+            TABS.pop(tid, None)
+    for _, t in muertas:
+        t.soltar()
+
+
 def estado_general():
     ahora = time.time()
+    _cosechar_tabs(ahora)
     parseadas = _sesiones_parseadas()
     meta = _meta_leer()
     with TABS_LOCK:
@@ -784,7 +1148,8 @@ def abrir_terminal(tty):
                                capture_output=True, text=True, timeout=10)
             if r.stdout.strip() == "ok":
                 return True, "listo"
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ osascript para traer la pestaña al frente falló (pruebo la otra app): {e}", file=sys.stderr)
             continue
     return False, "no encontré esa pestaña (¿Terminal cerrada?)"
 
@@ -808,17 +1173,27 @@ def _es_local(nombre):
     resuelva a 127.0.0.1 y hablarle a este server "desde adentro". En ese
     ataque el header Host/Origin SIEMPRE trae el dominio del atacante, así
     que alcanza con exigir que el nombre sea de esta máquina.
-    OJO: acá no vale rechazar todo lo que no sea 127.0.0.1 — con Tailscale
-    (userspace proxy) se entra también desde el teléfono o la laptop. Por eso:
+    OJO: acá no vale rechazar todo lo que no sea 127.0.0.1 — se entra
+    también por Tailscale (userspace proxy) desde el celular/laptop. Por eso:
     - IP literal (127.0.0.1, 100.x de Tailscale, LAN): vale SIEMPRE — una IP
       no se puede "rebindear", el navegador ya conectó a esa IP.
-    - Nombres: solo localhost, MagicDNS (*.ts.net) o nombres sin punto
-      (un dominio público del atacante necesita un punto sí o sí)."""
+    - Nombres: solo localhost, MagicDNS (*.ts.net), mDNS (*.local) o nombres
+      sin punto (un dominio público del atacante necesita un punto sí o sí).
+
+    `.local` se agregó el 16-ago-2026: desde el celular/laptop se entra por el
+    nombre Bonjour de la máquina (`equipo.local:8811`) y eso caía en "nombre con
+    punto que no es .ts.net" ⇒ 403 `host no permitido` — con la pantalla del PIN
+    fuera de alcance, o sea imposible de entrar y sin ninguna pista de por qué.
+    No abre la puerta: `.local` es un TLD reservado a mDNS, no se registra ni se
+    resuelve en el DNS público, así que no sirve para el ataque que esto tapa
+    (una web de internet que apunta su dominio a 127.0.0.1)."""
     if not nombre:
         return False
-    nombre = nombre.strip().lower()
-    if nombre.endswith(".ts.net") or "." not in nombre:
-        return True  # localhost, mac-mini, nombre.ts.net…
+    nombre = nombre.strip().lower().rstrip(".")   # el punto final del FQDN es legal
+    if not nombre:                     # "." o "..": queda vacío al sacarle el punto y, sin
+        return False                   # esta línea, caía en "no tiene punto" ⇒ aceptado
+    if nombre.endswith((".ts.net", ".local")) or "." not in nombre:
+        return True  # localhost, mac-mini, nombre.ts.net, nombre.local…
     try:
         ipaddress.ip_address(nombre)
         return True
@@ -828,105 +1203,253 @@ def _es_local(nombre):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    _cookie_pendiente = None   # token a entregar en esta respuesta (login por ?pin=)
 
     def _json(self, obj, code=200):
         cuerpo = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if self._cookie_pendiente:
+            self.send_header("Set-Cookie",
+                             self._COOKIE_SESION.format(tok=self._cookie_pendiente))
+            self._cookie_pendiente = None
         self.send_header("Content-Length", str(len(cuerpo)))
         self.end_headers()
         self.wfile.write(cuerpo)
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
+        self._body_leido = True
         return self.rfile.read(n) if n else b""
 
-    def _rebinding(self):
-        """True si el Host u Origin delatan una web ajena (ver _es_local)."""
+    def _rebinding(self, origin_null_ok=False):
+        """True si el Host u Origin delatan una web ajena (ver _es_local).
+
+        Anota en el log de seguridad QUÉ nombre rechazó (16-ago-2026): este 403 es
+        el único que se le puede aparecer al dueño legítimo entrando por un nombre
+        que la lista no contempla, y sin el nombre a la vista queda un
+        `{"error": "host no permitido"}` pelado que se diagnostica a ciegas. Con
+        `_una_vez` para que un bot machacando no escriba un log de gigas."""
         host = self.headers.get("Host")
         if host and not _es_local(urlparse("//" + host).hostname or ""):
+            self._log_rebinding("Host", host)
             return True
         origin = self.headers.get("Origin")
+        if origin == "null" and origin_null_ok:
+            # SOLO en la ruta del login, y solo el literal "null" (un dominio ajeno
+            # sigue rechazado por el Host y por acá). Cinturón sobre el arreglo de
+            # `_pagina_pin`: si mañana otro navegador vuelve a mandar `Origin: null`
+            # al mandar el formulario, el dueño entra igual en vez de comerse un 403
+            # que no puede diagnosticar desde el teléfono. No regala nada: para que
+            # este POST sirva de algo hay que traer el PIN correcto —y quien lo tiene
+            # ya puede entrar por la puerta— y los 8 intentos del freno siguen rigiendo.
+            return False
         if origin and not _es_local(urlparse(origin).hostname or ""):
+            self._log_rebinding("Origin", origin)
             return True  # cubre también Origin: null (hostname vacío)
         return False
 
-    # --- PIN ---------------------------------------------------------------
-    _COOKIE_PIN = ("cacho_pin={pin}; Path=/; Max-Age=31536000; "
-                   "SameSite=Lax; HttpOnly")
+    def _rechazo_host(self):
+        """El 403 del anti-rebinding, EXPLICADO si lo está viendo una persona.
 
-    def _pin_recibido(self):
-        """('cookie'|'query'|None) según de dónde vino un PIN correcto."""
+        Antes contestaba `{"error": "host no permitido"}` a todo. Para un navegador eso es
+        una pantalla negra con una línea de JSON: no dice qué nombre se rechazó, ni que la
+        puerta está sana y el problema es la dirección con la que se golpeó. Al dueño
+        entrando desde el teléfono lo deja adivinando (pasó el 16-ago-2026). A un script se
+        le sigue contestando el JSON de siempre — no rompe a nadie que ya lo lea.
+        Mostrar el nombre recibido no regala nada: lo eligió quien hizo la request."""
+        if "text/html" not in (self.headers.get("Accept") or ""):
+            return self._json({"error": "host no permitido"}, 403)
+        host = html_escape((self.headers.get("Host") or "(sin Host)")[:120])
+        cuerpo = (
+            "<!doctype html><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<style>body{background:#11151c;color:#e7ecf3;font:16px/1.5 -apple-system,"
+            "system-ui,sans-serif;margin:0;display:grid;place-items:center;min-height:100vh}"
+            "div{max-width:34rem;padding:2rem}code{background:#1c2430;padding:.15em .4em;"
+            "border-radius:4px;word-break:break-all}h1{font-size:1.25rem;margin:0 0 .75rem}"
+            "p{color:#9fb0c4}</style><div>"
+            "<h1>No se entra por esta dirección</h1>"
+            f"<p>Golpeaste con el nombre <code>{host}</code>, y solo se aceptan la IP, "
+            "<code>localhost</code>, los nombres de la red privada "
+            "(<code>.ts.net</code>, <code>.local</code>) o un nombre sin puntos. Es la "
+            "defensa contra que una web de internet le hable a este servidor por vos.</p>"
+            "<p>No es el PIN ni el servidor: está todo bien de este lado. Entrá por la "
+            "dirección de siempre.</p></div>").encode()
+        self.send_response(403)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self._seguridad()
+        self.send_header("Content-Length", str(len(cuerpo)))
+        self.end_headers()
+        self.wfile.write(cuerpo)
+
+    _REBIND_VISTOS = set()          # (cabecera, valor) ya anotados; tope abajo
+    _REBIND_LOCK = threading.Lock()
+
+    def _log_rebinding(self, cabecera, valor):
+        clave = (cabecera, valor[:120])
+        with self._REBIND_LOCK:
+            if clave in self._REBIND_VISTOS:
+                return
+            if len(self._REBIND_VISTOS) > 200:
+                self._REBIND_VISTOS.clear()
+            self._REBIND_VISTOS.add(clave)
+        _log_seguridad(f"RECHAZO por {cabecera} ajeno: {clave[1]!r} (ip {self._ip})")
+
+    # --- Puerta: token de sesión (adentro) vs PIN (login) -------------------
+    _COOKIE_SESION = ("cacho_sesion={tok}; Path=/; Max-Age=31536000; "
+                      "SameSite=Lax; HttpOnly")
+
+    @property
+    def _ip(self):
+        return self.client_address[0] if self.client_address else "?"
+
+    def _cookie(self, nombre):
         for parte in (self.headers.get("Cookie") or "").split(";"):
             parte = parte.strip()
-            if parte.startswith("cacho_pin=") and parte[10:] == PIN:
-                return "cookie"
+            if parte.startswith(nombre + "="):
+                return parte[len(nombre) + 1:]
+        return ""
+
+    def _adentro(self):
+        """True si la request trae un token de sesión válido. Este camino NO pasa
+        por el freno: un token de 256 bits no se adivina, y frenarlo sería dejar
+        afuera al dueño cada vez que alguien golpea la puerta."""
+        return _sesion_valida(self._cookie("cacho_sesion"))
+
+    def _pin_ok(self):
+        """True si la request trae credencial de login válida por la URL: el PIN
+        (?pin=) o un ticket de un solo uso (?t=, el que usa el lanzador). Cuenta
+        como intento: si está mal, suma al freno."""
         q = parse_qs(urlparse(self.path).query)
-        if q.get("pin", [""])[0] == PIN:
-            return "query"
-        return None
+        if q.get("t"):
+            if _ticket_usar(q["t"][0]):
+                _acierto_pin(self._ip)
+                return True
+            _fallo_pin(self._ip)
+            return False
+        if not q.get("pin"):
+            return False
+        if _pin_igual(q["pin"][0]):
+            _acierto_pin(self._ip)
+            return True
+        _fallo_pin(self._ip)
+        return False
+
+    def _seguridad(self, referrer="no-referrer"):
+        """Cabeceras de endurecimiento de la página. Cuestan cero y tapan familias
+        enteras de ataque: nada de esta app se carga de afuera ni tiene por qué
+        vivir dentro del iframe de otro sitio.
+
+        `referrer` es parámetro por UNA página: la del PIN (ver `_pagina_pin`), que
+        con `no-referrer` se dejaba afuera a sí misma."""
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", referrer)
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; form-action 'self'; base-uri 'none'; "
+            "object-src 'none'; frame-ancestors 'none'")
+
+    def _pagina(self):
+        cuerpo = PAGINA.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self._seguridad()
+        self.send_header("Content-Length", str(len(cuerpo)))
+        self.end_headers()
+        self.wfile.write(cuerpo)
+
+    def _redirigir_sin_pin(self, tok):
+        """303 a la misma ruta sin el ?pin=, entregando el token de sesión."""
+        u = urlparse(self.path)
+        q = {k: v for k, v in parse_qs(u.query).items() if k != "pin"}
+        destino = u.path + ("?" + urlencode(q, doseq=True) if q else "")
+        self.send_response(303)
+        self.send_header("Location", destino or "/")
+        self.send_header("Set-Cookie", self._COOKIE_SESION.format(tok=tok))
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _bloqueo(self, espera):
+        """429 INSTANTÁNEO. Clave: no dormir. Dormir la request no frena a nadie
+        (el atacante las lanza en paralelo) y le regala un thread por intento."""
+        cuerpo = json.dumps({"error": "demasiados PIN equivocados",
+                             "reintentar_en_seg": int(espera) + 1}).encode()
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Retry-After", str(int(espera) + 1))
+        self.send_header("Content-Length", str(len(cuerpo)))
+        self.end_headers()
+        self.wfile.write(cuerpo)
 
     def _pagina_pin(self, error=False):
         aviso = ('<div class="err">PIN incorrecto</div>' if error else "")
         cuerpo = PAGINA_PIN.replace("{{AVISO}}", aviso).encode()
         self.send_response(403 if error else 401)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        # Las MISMAS cabeceras que el resto de la app (16-ago-2026): esta pantalla
+        # se estaba sirviendo pelada, y es la única que ve alguien que todavía no
+        # entró — o sea, justo la que pide la llave de la máquina. Sin
+        # X-Frame-Options una web ajena la mete en un iframe (el Host es una IP
+        # literal, que _es_local acepta a propósito, y una navegación de iframe no
+        # manda Origin) y le dibuja encima lo que quiera para que el PIN se tipee
+        # ahí. Verificado con curl: no salía ni una cabecera de seguridad.
+        #
+        # PERO el `no-referrer` del resto NO va acá (16-ago-2026, «sigue sin entrar
+        # Cacho en el celular»): esta pantalla es la única que manda un FORMULARIO, y
+        # por la spec de Fetch, en una navegación que no es GET con la política
+        # `no-referrer` el navegador manda `Origin: null` — que el anti-rebinding de
+        # más arriba rechaza. Resultado: tipeás el PIN bien y te contesta 403
+        # `host no permitido`, o sea la puerta trabada con la llave puesta. No se ve
+        # desde la propia máquina porque ahí ya está la cookie y esta pantalla nunca
+        # aparece; se ve SOLO desde un dispositivo nuevo, que es cuando más molesta.
+        # `same-origin` protege lo mismo hacia afuera (a otro sitio no le llega nada)
+        # y deja que el formulario diga de dónde viene.
+        self._seguridad(referrer="same-origin")
         self.send_header("Content-Length", str(len(cuerpo)))
         self.end_headers()
         self.wfile.write(cuerpo)
 
+    # Lo ÚNICO que se sirve sin PIN. Antes era "/static/ entero", y esa carpeta
+    # es justamente donde se dejan archivos para mirar (mails, capturas, informes):
+    # o sea, material del negocio servido a cualquiera que llegue al puerto, sin
+    # autenticarse. Ahora solo pasa el logo —que lo necesita la propia pantalla del
+    # PIN— y el ping, que el lanzador usa como healthcheck y no dice nada de nadie.
+    _SIN_PIN = {"/api/ping", "/static/cacho.png"}
+
     def do_GET(self):
         if self._rebinding():
-            return self._json({"error": "host no permitido"}, 403)
+            return self._rechazo_host()
         ruta = urlparse(self.path).path
         if ruta in ("/apple-touch-icon.png", "/apple-touch-icon-precomposed.png"):
             return self._icono_ios()
-        # /static y el ping quedan libres (assets y healthcheck del lanzador);
-        # todo lo demás —la página, las APIs, los streams— exige el PIN.
-        if ruta != "/api/ping" and not ruta.startswith("/static/"):
-            origen = self._pin_recibido()
-            if not origen:
+        if ruta not in self._SIN_PIN and not self._adentro():
+            # ya no estás adentro: esto es un LOGIN, y el login está frenado
+            espera = _bloqueado(self._ip)
+            if espera:
+                return self._bloqueo(espera)
+            if not self._pin_ok():
                 if ruta.startswith("/api/"):
                     return self._json({"error": "falta el PIN"}, 403)
                 return self._pagina_pin()
-            if origen == "query" and ruta == "/":
-                # vino con ?pin= (lanzador o primer acceso): dejar cookie
-                cuerpo = PAGINA.encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Set-Cookie", self._COOKIE_PIN.format(pin=PIN))
-                self.send_header("Content-Length", str(len(cuerpo)))
-                self.end_headers()
-                self.wfile.write(cuerpo)
-                return
+            if not ruta.startswith("/api/"):
+                # Navegador: se le da el token y se REDIRIGE a la URL sin el ?pin=.
+                # Si no, el PIN queda a la vista en la barra, en el historial y en
+                # cualquier captura de pantalla que se saque de Cacho.
+                return self._redirigir_sin_pin(_sesion_nueva())
+            # Script local (cacho_lanzar.py) con ?pin=: se le deja pasar ESTA
+            # request y no se le abre sesión. Si se le diera token, cada llamada
+            # dejaría uno nuevo y en tres lanzamientos echaría de la lista a los
+            # dispositivos de verdad (el cupo es de 20).
         if ruta == "/":
-            cuerpo = PAGINA.encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(cuerpo)))
-            self.end_headers()
-            self.wfile.write(cuerpo)
+            return self._pagina()
         elif ruta.startswith("/static/"):
-            nombre = os.path.basename(ruta)
-            p = os.path.join(AQUI, "static", nombre)
-            if not os.path.isfile(p):
-                return self._json({"error": "no existe"}, 404)
-            with open(p, "rb") as fh:
-                cuerpo = fh.read()
-            if nombre.endswith(".css"):
-                tipo = "text/css"
-            elif nombre.endswith(".png"):
-                tipo = "image/png"
-            elif nombre.endswith(".html"):
-                tipo = "text/html"
-            else:
-                tipo = "application/javascript"
-            self.send_response(200)
-            self.send_header("Content-Type", tipo + "; charset=utf-8")
-            self.send_header("Content-Length", str(len(cuerpo)))
-            self.send_header("Cache-Control", "max-age=86400")
-            self.end_headers()
-            self.wfile.write(cuerpo)
+            return self._static(os.path.basename(ruta))
         elif ruta == "/api/ping":
             self._json({"ok": True, "boot": BOOT_ID})
         elif ruta == "/api/estado":
@@ -978,6 +1501,39 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(b"event: fin\ndata: \n\n")
                     self.wfile.flush()
                     break
+                # Juntar lo que ya esté esperando en la cola y mandarlo en UN evento.
+                #
+                # Por qué (17-ago-2026): una sesión que trabaja fuerte escupe muchísimo por el
+                # PTY — medido en vivo, la carga de mails iba a 261-486 KB/s. Mandando un evento
+                # SSE por trozo, el navegador recibía 17-30 eventos/s y cada uno le costaba un
+                # b64bytes() + un term.write() que xterm.js encola y parsea aparte. El renderer
+                # de la pestaña de Cacho llegó a picos de 328 MB (y ese día a 1.839 MB), ahogó la
+                # Mac y congeló la ventana: parecía que "se colgó Cacho" con el server impecable.
+                #
+                # Agrupar NO pierde un byte —es el mismo stream, en bloques más grandes— y le
+                # saca al front la mayor parte del trabajo por byte. El tope evita el otro
+                # extremo: un bloque gigante que tarde en pintarse y trabe la pestaña.
+                if len(d) < COALESCE_MAX:
+                    trozos = [d]
+                    total = len(d)
+                    fin = False
+                    while total < COALESCE_MAX:
+                        try:
+                            extra = q.get_nowait()
+                        except Empty:
+                            break
+                        if extra is None:   # la sesión terminó mientras juntábamos
+                            fin = True
+                            break
+                        trozos.append(extra)
+                        total += len(extra)
+                    d = b"".join(trozos)
+                    self._sse(d)
+                    if fin:
+                        self.wfile.write(b"event: fin\ndata: \n\n")
+                        self.wfile.flush()
+                        break
+                    continue
                 self._sse(d)
         except (BrokenPipeError, ConnectionResetError, OSError):
             pass
@@ -985,6 +1541,61 @@ class Handler(BaseHTTPRequestHandler):
             with t.lock:
                 if q in t.subs:
                     t.subs.remove(q)
+
+    # tipos que se sirven de /static. Lo que no esté acá se manda como descarga:
+    # antes CUALQUIER extensión desconocida salía como application/javascript.
+    _TIPOS = {".css": "text/css", ".js": "application/javascript",
+              ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+              ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml",
+              ".html": "text/html", ".json": "application/json",
+              ".pdf": "application/pdf", ".txt": "text/plain"}
+
+    def _static(self, nombre):
+        """Sirve static/<nombre> con ETag.
+
+        Antes iba `Cache-Control: max-age=86400` a secas: cambiabas la cara de Cacho
+        (o cualquier imagen que se pasa por acá para mirarla) y el navegador seguía
+        mostrando la vieja hasta un día entero, sin forma de saber por qué. Ahora
+        revalida siempre y el server contesta 304 vacío si no cambió — cuesta lo
+        mismo que un ping. Las libs (xterm) sí quedan cacheadas duro: no cambian."""
+        p = os.path.join(AQUI, "static", nombre)
+        if not os.path.isfile(p):
+            return self._json({"error": "no existe"}, 404)
+        st = os.stat(p)
+        etag = '"%x-%x"' % (int(st.st_mtime), st.st_size)
+        ext = os.path.splitext(nombre)[1].lower()
+        inmutable = nombre.startswith(("xterm.", "addon-"))
+        cache = "max-age=31536000, immutable" if inmutable else "no-cache"
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Cache-Control", cache)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        with open(p, "rb") as fh:
+            cuerpo = fh.read()
+        tipo = self._TIPOS.get(ext, "application/octet-stream")
+        if tipo.startswith(("text/", "application/javascript", "application/json")):
+            tipo += "; charset=utf-8"
+        self.send_response(200)
+        self.send_header("Content-Type", tipo)
+        self.send_header("Content-Length", str(len(cuerpo)))
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", cache)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        if ext in (".html", ".svg"):
+            # `sandbox` los deja en un origen OPACO: se ven igual, pero dejan de
+            # ser "código de Cacho". Sin esto, cualquier .html que alguien deje en
+            # static/ (que es la bandeja donde se dejan cosas para mirar: mails,
+            # informes, capturas) corre con el origen del server y puede llamar a
+            # /api/term/*/input con la cookie puesta — o sea, escribir en la
+            # terminal. Un archivo de adorno no puede tener ese poder.
+            self.send_header("Content-Security-Policy",
+                             "sandbox; default-src 'none'; img-src data: 'self'; "
+                             "style-src 'unsafe-inline'; font-src data:")
+        self.end_headers()
+        self.wfile.write(cuerpo)
 
     def _sse(self, data):
         self.wfile.write(b"data: " + base64.b64encode(data) + b"\n\n")
@@ -1004,26 +1615,68 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(cuerpo)
 
     def do_POST(self):
-        if self._rebinding():
-            return self._json({"error": "host no permitido"}, 403)
+        """Despacha el POST y, si se lo rechazó SIN leer su cuerpo, cierra la conexión.
+
+        Sin esto (16-ago-2026, entrando desde el teléfono): el POST del login trae
+        `pin=NNNN` en el cuerpo; si el server contesta y vuelve sin leerlo —bloqueo por
+        PIN equivocado, 403 anti-rebinding, 404—, esos bytes quedan en el socket y, como
+        acá se habla HTTP/1.1 con keep-alive, el navegador reusa la conexión y la request
+        siguiente se lee corrompida: `501 Unsupported method ('pin=8940GET')`, y desde ahí
+        Cacho no abre más hasta cerrar el navegador. Cerrar la conexión al rechazar corta
+        el problema de raíz, valga para el endpoint que valga."""
+        self._body_leido = False
+        try:
+            self._despachar_post()
+        finally:
+            if not self._body_leido and int(self.headers.get("Content-Length") or 0) > 0:
+                self.close_connection = True
+
+    def _despachar_post(self):
         u = urlparse(self.path)
         ruta = u.path
+        if self._rebinding(origin_null_ok=(ruta == "/pin")):
+            return self._json({"error": "host no permitido"}, 403)
         q = parse_qs(u.query)
 
-        if ruta == "/pin":
+        if ruta == "/api/ticket":
+            # Lo pide el lanzador de la app, mandando el PIN en el CUERPO (no en la
+            # URL ni como argumento): así el PIN no aparece en `ps` ni en ningún log.
+            espera = _bloqueado(self._ip)
+            if espera:
+                return self._bloqueo(espera)
             datos = parse_qs(self._body().decode("utf-8", "replace"))
-            if datos.get("pin", [""])[0] == PIN:
+            if not (self._adentro() or _pin_igual(datos.get("pin", [""])[0])):
+                _fallo_pin(self._ip)
+                return self._json({"error": "falta el PIN"}, 403)
+            _acierto_pin(self._ip)
+            return self._json({"t": _ticket_nuevo(), "vida_seg": TICKET_VIDA})
+
+        if ruta == "/pin":
+            espera = _bloqueado(self._ip)
+            if espera:
+                return self._bloqueo(espera)
+            datos = parse_qs(self._body().decode("utf-8", "replace"))
+            if _pin_igual(datos.get("pin", [""])[0]):
+                _acierto_pin(self._ip)
                 self.send_response(303)
                 self.send_header("Location", "/")
-                self.send_header("Set-Cookie", self._COOKIE_PIN.format(pin=PIN))
+                self.send_header("Set-Cookie",
+                                 self._COOKIE_SESION.format(tok=_sesion_nueva()))
                 self.send_header("Content-Length", "0")
                 self.end_headers()
             else:
-                time.sleep(1.5)  # freno anti fuerza bruta
+                _fallo_pin(self._ip)
                 self._pagina_pin(error=True)
             return
-        if not self._pin_recibido():
-            return self._json({"error": "falta el PIN"}, 403)
+
+        if not self._adentro():
+            espera = _bloqueado(self._ip)
+            if espera:
+                return self._bloqueo(espera)
+            if not self._pin_ok():
+                return self._json({"error": "falta el PIN"}, 403)
+            # ?pin= en un POST = script local: pasa esta request, sin abrir sesión
+            # (ver el mismo razonamiento en do_GET)
 
         if ruta.startswith("/api/sesion/") and ruta.endswith("/meta"):
             # Fijar arriba / renombrar / reordenar una sesión de la barra izquierda.
@@ -1075,6 +1728,14 @@ class Handler(BaseHTTPRequestHandler):
                 permitidos = {p["cwd"] for p in proyectos()}
                 if cwd not in permitidos:
                     return self._json({"error": "proyecto inválido"}, 400)
+            # Tope de pestañas: cada una es un zsh + un `claude` + un pty. Sin
+            # techo, un cliente en bucle (un script con un error, no hace falta
+            # mala intención) deja la máquina sin procesos ni memoria.
+            with TABS_LOCK:
+                if len(TABS) >= MAX_TABS:
+                    return self._json(
+                        {"error": f"ya hay {MAX_TABS} pestañas abiertas; "
+                                  "cerrá alguna con la ✕"}, 429)
             t = TermSession(cwd, resume_id=resume)
             with TABS_LOCK:
                 TABS[t.id] = t
@@ -1098,8 +1759,11 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     b = json.loads(self._body())
                     t.resize(int(b["cols"]), int(b["rows"]))
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"⚠️ resize de la pestaña {tid} vino mal formado (lo ignoro): {e}", file=sys.stderr)
+                    # antes contestaba ok:True igual — el front creía que la terminal
+                    # había quedado del tamaño nuevo cuando no se tocó nada
+                    return self._json({"ok": False, "msg": str(e)})
                 return self._json({"ok": True})
             if accion == "kill":
                 t.matar()
@@ -2808,8 +3472,30 @@ async function refrescar(){
 </html>"""
 
 
+class Servidor(ThreadingHTTPServer):
+    """
+    ThreadingHTTPServer que no grita cuando el navegador cuelga la llamada.
+
+    Por qué (17-ago-2026): el log ~/Library/Logs/sesiones-claude.log tenía 591
+    tracebacks de ConnectionResetError y 16 de BrokenPipeError en 900 KB. No son
+    fallas: son los SSE/fetch que el front corta al recargar la página o al
+    cambiar de pestaña, y socketserver.handle_error los imprime enteros a stderr.
+    El problema es que TAPAN lo que sí importa — el único error real del log (un
+    JSONDecodeError) estaba enterrado entre 600 tracebacks iguales.
+
+    La regla de la casa (errores explícitos y ruidosos) se mantiene: solo se
+    silencian esas dos excepciones, que significan "el cliente se fue". Cualquier
+    otra sigue saliendo con su traceback completo.
+    """
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], (ConnectionResetError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
+
+
 if __name__ == "__main__":
-    server = ThreadingHTTPServer((BIND, PORT), Handler)
+    server = Servidor((BIND, PORT), Handler)
     print(f"Cacho en http://{BIND}:{PORT}  (Ctrl-C para cortar)")
     try:
         server.serve_forever()
