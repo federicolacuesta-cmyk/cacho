@@ -64,8 +64,17 @@ AQUI = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("CACHO_PORT", "8811"))
 BIND = "127.0.0.1"   # NO cambiar a 0.0.0.0: expondría terminales por red
 CHUNK = 256 * 1024   # bytes que se leen de cabeza/cola de cada transcript
-TOPE_BUFFER = 2_000_000  # scrollback por terminal; es lo que se re-manda al reconectar
+TOPE_BUFFER = 2_000_000  # scrollback que se guarda por terminal
 COALESCE_MAX = 64 * 1024  # tope al juntar trozos del PTY en un solo evento SSE (ver _stream)
+# Tope de lo que se re-manda al ENTRAR de nuevo a una pestaña, cuando no se puede
+# mandar solo lo nuevo (ver _stream). Antes se re-mandaban los 2 MB enteros en UN
+# evento: el navegador armaba un texto de 2,7 MB, lo decodificaba y se lo daba de
+# golpe a la terminal, todo en el hilo que pinta. Medido el 19-ago-2026 con 19
+# pestañas abiertas: 9,5 MB para repartir, 2,6 MB la más gorda. Resultado, el panel
+# quedaba negro y mudo unos segundos por pestaña, y como al cambiar de pestaña se
+# empezaba de cero, la sensación era "no muestra nada en ninguna".
+SNAPSHOT_MAX = 512 * 1024
+SSE_TROZO = 64 * 1024     # el arranque se manda en pedazos: la pantalla pinta mientras llega
 
 # Identidad de ESTE arranque del server. La página lo compara contra /api/ping
 # y se recarga sola si cambió: reiniciar el server NO recarga las ventanas de
@@ -284,7 +293,7 @@ def _sesion_valida(tok):
 
 
 # ─── Tickets de un solo uso (para el lanzador de la app) ──────────────────────
-# El lanzador abría Chrome con `--app=http://…/?pin=1234`. Eso deja el PIN en la
+# El lanzador abría Chrome con `--app=http://…/?pin=NNNN`. Eso deja el PIN en la
 # LÍNEA DE COMANDOS de Chrome, que cualquier proceso de la máquina lee con `ps`
 # mientras la ventana viva — horas. Ahora el lanzador cambia el PIN (que le pasa
 # al server por stdin, no por argumento) por un ticket que vale 60 segundos y una
@@ -693,6 +702,10 @@ class TermSession:
         self.creado = time.time()
         self.last_out = time.time()
         self.buf = bytearray()
+        # total de bytes que esta pestaña escupió DESDE SIEMPRE (el buf se recorta,
+        # esto no). Es la regla que le deja al navegador pedir "dame de acá en
+        # adelante" al volver a una pestaña, en vez de rearmarla entera. Ver _stream.
+        self.escritos = 0
         self.subs = []
         self.lock = threading.Lock()
         # retomar una charla terminada: claude --resume sigue en el MISMO
@@ -757,6 +770,7 @@ class TermSession:
                    "\r\n>> Cerrala y abri otra.\r\n").encode()
             with self.lock:
                 self.buf += msg
+                self.escritos += len(msg)
                 for q in list(self.subs):
                     q.put(msg)
 
@@ -770,6 +784,7 @@ class TermSession:
                 break
             with self.lock:
                 self.buf += d
+                self.escritos += len(d)
                 if len(self.buf) > TOPE_BUFFER:
                     del self.buf[: len(self.buf) - TOPE_BUFFER]
                 self.last_out = time.time()
@@ -1478,6 +1493,13 @@ class Handler(BaseHTTPRequestHandler):
             t = TABS.get(tid)
         if not t:
             return self._json({"error": "no existe"}, 404)
+        # "desde": cuántos bytes de esta pestaña ya tiene el navegador. Si todavía
+        # los tenemos en el buffer, se le manda SOLO lo que se perdió y no borra lo
+        # que ya pintó — volver a una pestaña pasa a costar casi nada.
+        try:
+            desde = int(parse_qs(urlparse(self.path).query).get("desde", ["-1"])[0])
+        except ValueError:
+            desde = -1
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
@@ -1485,11 +1507,33 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         q = Queue()
         with t.lock:
-            snapshot = bytes(t.buf)
+            escritos = t.escritos
+            atraso = escritos - desde
+            if 0 <= desde <= escritos and atraso <= len(t.buf):
+                # al día (o casi): solo el pedazo que falta, sin borrar la pantalla
+                snapshot = bytes(t.buf[len(t.buf) - atraso:]) if atraso else b""
+                limpiar = False
+                pos = desde
+            else:
+                # primera vez, o quedó tan atrás que ya no está: se rearma, pero con
+                # la COLA del scrollback, no con los 2 MB enteros
+                snapshot = bytes(t.buf[-SNAPSHOT_MAX:])
+                limpiar = True
+                pos = escritos - len(snapshot)
             t.subs.append(q)
         try:
-            if snapshot:
-                self._sse(snapshot)
+            # el navegador necesita saber si tiene que borrar lo que ya pintó y en
+            # qué byte arranca lo que viene, para poder pedir "desde acá" la próxima
+            self.wfile.write(b"event: base\ndata: "
+                             + json.dumps({"pos": pos, "limpiar": limpiar,
+                                           "bytes": len(snapshot)}).encode()
+                             + b"\n\n")
+            self.wfile.flush()
+            # en pedazos: si va todo junto, el navegador arma un texto gigante, lo
+            # decodifica y lo pinta de una sola vez — y mientras tanto la ventana
+            # entera queda congelada. En pedazos empieza a verse enseguida.
+            for i in range(0, len(snapshot), SSE_TROZO):
+                self._sse(snapshot[i:i + SSE_TROZO])
             while True:
                 try:
                     d = q.get(timeout=15)
@@ -1621,7 +1665,7 @@ class Handler(BaseHTTPRequestHandler):
         `pin=NNNN` en el cuerpo; si el server contesta y vuelve sin leerlo —bloqueo por
         PIN equivocado, 403 anti-rebinding, 404—, esos bytes quedan en el socket y, como
         acá se habla HTTP/1.1 con keep-alive, el navegador reusa la conexión y la request
-        siguiente se lee corrompida: `501 Unsupported method ('pin=8940GET')`, y desde ahí
+        siguiente se lee corrompida: `501 Unsupported method ('pin=NNNNGET')`, y desde ahí
         Cacho no abre más hasta cerrar el navegador. Cerrar la conexión al rechazar corta
         el problema de raíz, valga para el endpoint que valga."""
         self._body_leido = False
@@ -2034,6 +2078,15 @@ body{
 }
 .term-box.ver{display:block}
 .term-box .xterm{height:100%}
+/* mientras la pestaña se arma. Antes el panel quedaba negro y mudo y no había
+   forma de saber si estaba cargando o si se había roto algo (19-ago-2026) */
+.term-box.cargando.ver::after{
+  content:"cargando la sesión…"; position:absolute; inset:0; display:flex;
+  align-items:center; justify-content:center; color:var(--tenue);
+  font:13px/1 var(--display), system-ui, sans-serif; letter-spacing:.02em;
+  background:var(--term-bg); border-radius:12px; animation:latir 1.2s ease-in-out infinite;
+}
+@keyframes latir{0%,100%{opacity:.45} 50%{opacity:.9}}
 .xterm-viewport::-webkit-scrollbar{width:8px}
 .xterm-viewport::-webkit-scrollbar-track{background:transparent}
 .xterm-viewport::-webkit-scrollbar-thumb{background:rgba(232,230,220,.22); border-radius:4px}
@@ -2430,10 +2483,25 @@ function abrirTab(id){
 function conectar(id){
   const a = abiertas[id];
   if(!a || a.es) return;
-  a.term.reset();
-  const es = new EventSource(`/api/term/${id}/stream`);
-  es.onmessage = e => a.term.write(b64bytes(e.data));
+  // se le dice al server hasta qué byte tenemos: si lo tiene guardado nos manda
+  // solo lo nuevo y la pestaña aparece al toque, sin repintarla entera (19-ago-2026)
+  const desde = (a.pos == null) ? -1 : a.pos;
+  a.box.classList.add("cargando");
+  const es = new EventSource(`/api/term/${id}/stream?desde=${desde}`);
+  es.addEventListener("base", e => {
+    const b = JSON.parse(e.data);
+    if(b.limpiar) a.term.reset();
+    a.pos = b.pos;
+    if(!b.bytes) a.box.classList.remove("cargando");   // no viene nada: no hay qué esperar
+  });
+  es.onmessage = e => {
+    const bytes = b64bytes(e.data);
+    a.pos = (a.pos || 0) + bytes.length;
+    a.box.classList.remove("cargando");
+    a.term.write(bytes);
+  };
   es.addEventListener("fin", () => {
+    a.box.classList.remove("cargando");
     a.term.write("\r\n\x1b[38;2;45;156;219m— sesión terminada —\x1b[0m\r\n");
     es.close(); a.es = null;
   });
@@ -2442,6 +2510,7 @@ function conectar(id){
     // corte definitivo). Sin esto la terminal quedaba congelada muda.
     if(es.readyState === 2){
       a.es = null;
+      a.box.classList.remove("cargando");
       a.term.write("\r\n\x1b[38;2;110;108;100m— conexión cortada: tocá la sesión en la barra para reconectar —\x1b[0m\r\n");
     }
   };
