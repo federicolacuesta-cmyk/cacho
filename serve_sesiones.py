@@ -695,6 +695,59 @@ def _modelo_preferido():
     return modelo if _MODELO_OK.match(modelo) else ""
 
 
+# El id de la charla lo elige la pestaña y se lo IMPONE a claude (`--session-id`).
+# Se comprueba UNA vez que esta máquina lo acepte: si tuviera una versión vieja del
+# CLI, arrancar con una opción desconocida dejaría la pestaña muerta al instante.
+_SESSION_ID_OK = None
+_SESSION_ID_LOCK = threading.Lock()
+_PATH_PESTANA = ("$HOME/.local/bin:$HOME/.claude/local:$HOME/.npm-global/bin:"
+                 "/opt/homebrew/bin:/usr/local/bin:$PATH")
+
+
+def _soporta_session_id():
+    """Si el `claude` de esta máquina acepta --session-id (cacheado)."""
+    global _SESSION_ID_OK
+    with _SESSION_ID_LOCK:
+        if _SESSION_ID_OK is None:
+            try:
+                salida = subprocess.run(
+                    ["/bin/zsh", "-lc", f'PATH="{_PATH_PESTANA}"; claude --help'],
+                    capture_output=True, text=True, timeout=30).stdout
+                _SESSION_ID_OK = "--session-id" in salida
+                if not _SESSION_ID_OK:
+                    print("⚠️ este claude no acepta --session-id: las pestañas nuevas "
+                          "vuelven a emparejarse con su charla a ojo (títulos que se "
+                          "pueden cruzar). Actualizá Claude Code.", file=sys.stderr)
+            except Exception as e:
+                # No poder preguntar no es razón para romper la pestaña: se asume que no.
+                print(f"⚠️ no pude ver si claude acepta --session-id, sigo sin él: {e}",
+                      file=sys.stderr)
+                _SESSION_ID_OK = False
+        return _SESSION_ID_OK
+
+
+def arranque_stream(buf, escritos, desde):
+    """Qué mandarle a un navegador que se (re)conecta a una pestaña.
+
+    Devuelve (bytes a mandar, si tiene que borrar lo que ya pintó, byte en que arranca).
+
+    `desde` es hasta qué byte dice tener el navegador; -1 (o basura) = no tiene nada.
+    Si lo que le falta sigue en el buffer, se le manda SOLO eso y no se le borra la
+    pantalla: volver a una pestaña deja de costar. Si viene de cero o quedó tan atrás
+    que el pedazo que le falta ya se recortó, se rearma la pantalla — pero con la COLA
+    del scrollback, nunca con los 2 MB enteros (que era lo que dejaba el panel negro
+    y mudo unos segundos por pestaña, 19-ago-2026).
+    """
+    atraso = escritos - desde
+    # el delta también se topea: si mientras mirabas otra pestaña esta escupió 1,9 MB,
+    # mandárselos "porque los tenemos" sería el mismo atragantón que se está sacando.
+    # Pasado el tope, la cola sola ya alcanza (es todo redibujado de la misma pantalla).
+    if 0 <= desde <= escritos and atraso <= min(len(buf), SNAPSHOT_MAX):
+        return (bytes(buf[len(buf) - atraso:]) if atraso else b""), False, desde
+    cola = bytes(buf[-SNAPSHOT_MAX:])
+    return cola, True, escritos - len(cola)
+
+
 class TermSession:
     def __init__(self, cwd, resume_id=""):
         self.id = uuid.uuid4().hex[:8]
@@ -711,7 +764,15 @@ class TermSession:
         # retomar una charla terminada: claude --resume sigue en el MISMO
         # transcript, así que se vincula de entrada (título y estado al toque)
         self.resume_id = resume_id
-        self.transcript_id = resume_id
+        # Charla NUEVA: el id lo elige la pestaña y se lo impone a claude con
+        # --session-id, así queda pegada a SU transcript por construcción. Antes se
+        # adivinaba después comparando la hora de creación de la pestaña con la del
+        # primer mensaje de cada charla, y eso se cruzaba cuando varias arrancaban
+        # en la misma carpeta con poco tiempo entre una y otra: el título mostrado
+        # era el de la charla de al lado (visto 19-ago-2026 con tres corridas
+        # automáticas lanzadas en el mismo minuto).
+        self.sid_propio = "" if resume_id or not _soporta_session_id() else str(uuid.uuid4())
+        self.transcript_id = resume_id or self.sid_propio
         self.titulo = ""
 
         env = {k: v for k, v in os.environ.items()
@@ -745,8 +806,14 @@ class TermSession:
         # oficial lo deja en ~/.local/bin y el de npm en ~/.npm-global/bin, como
         # en la MacBook). Si tampoco está ahí, decirlo en pantalla en vez de
         # dejar la pestaña negra.
-        # resume_id ya viene validado ([0-9a-f-]): seguro para la línea de comando
-        claude = ("claude --resume " + self.resume_id) if self.resume_id else "claude"
+        # resume_id ya viene validado ([0-9a-f-]) y sid_propio es un uuid4 nuestro:
+        # los dos son seguros para la línea de comando
+        if self.resume_id:
+            claude = "claude --resume " + self.resume_id
+        elif self.sid_propio:
+            claude = "claude --session-id " + self.sid_propio
+        else:
+            claude = "claude"
         # Si existe ~/.cacho_modelo, las pestañas nuevas arrancan con ese modelo. Sirve
         # para que un vigía externo cambie de modelo solo (p. ej. bajar a uno más barato
         # cuando se agota el cupo del más caro, y volver cuando se renueva) sin tocar el
@@ -757,8 +824,7 @@ class TermSession:
             # (`claude-opus-5[1m]`) y zsh lo toma como glob → "no matches found".
             claude += " --model '" + modelo + "'"
         cmd = (
-            'PATH="$HOME/.local/bin:$HOME/.claude/local:$HOME/.npm-global/bin:'
-            '/opt/homebrew/bin:/usr/local/bin:$PATH"; '
+            f'PATH="{_PATH_PESTANA}"; '
             f"if command -v claude >/dev/null; then {claude}; "
             "else echo '>> Falta Claude Code en esta maquina. Instalalo con:'; "
             "echo '>>   curl -fsSL https://claude.ai/install.sh | bash'; fi"
@@ -952,6 +1018,13 @@ def _aplicar_meta(item, sid, meta):
 
 def _vincular_transcripts(tabs, parseadas):
     """Asocia cada pestaña de la app con su transcript (título y estado).
+
+    RED DE SEGURIDAD, no el camino normal: desde el 19-ago-2026 las pestañas
+    nuevas nacen con su id de charla puesto por `--session-id`, así que llegan acá
+    ya vinculadas. Esto solo emparcha lo que quedó suelto: pestañas abiertas antes
+    de ese cambio, una máquina con un CLI viejo que no acepte la opción, o alguien
+    que escribió `claude` a mano dentro de una pestaña. Adivinar por hora se cruza
+    cuando arrancan varias charlas juntas en la misma carpeta.
 
     El transcript nace ~1 s después de que la pestaña lanza `claude`, así que
     la señal firme es primer_ts ≈ t.creado. Antes se elegía max(mtime) entre
@@ -1507,19 +1580,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         q = Queue()
         with t.lock:
-            escritos = t.escritos
-            atraso = escritos - desde
-            if 0 <= desde <= escritos and atraso <= len(t.buf):
-                # al día (o casi): solo el pedazo que falta, sin borrar la pantalla
-                snapshot = bytes(t.buf[len(t.buf) - atraso:]) if atraso else b""
-                limpiar = False
-                pos = desde
-            else:
-                # primera vez, o quedó tan atrás que ya no está: se rearma, pero con
-                # la COLA del scrollback, no con los 2 MB enteros
-                snapshot = bytes(t.buf[-SNAPSHOT_MAX:])
-                limpiar = True
-                pos = escritos - len(snapshot)
+            snapshot, limpiar, pos = arranque_stream(t.buf, t.escritos, desde)
             t.subs.append(q)
         try:
             # el navegador necesita saber si tiene que borrar lo que ya pintó y en
@@ -2082,7 +2143,7 @@ body{
    forma de saber si estaba cargando o si se había roto algo (19-ago-2026) */
 .term-box.cargando.ver::after{
   content:"cargando la sesión…"; position:absolute; inset:0; display:flex;
-  align-items:center; justify-content:center; color:var(--tenue);
+  align-items:center; justify-content:center; color:#8E8C84;
   font:13px/1 var(--display), system-ui, sans-serif; letter-spacing:.02em;
   background:var(--term-bg); border-radius:12px; animation:latir 1.2s ease-in-out infinite;
 }
@@ -2431,7 +2492,10 @@ function abrirTab(id){
   $("#terms").appendChild(box);
   const term = new Terminal({
     fontFamily:'"SF Mono", Menlo, monospace', fontSize: MOVIL ? 12 : 15,
-    cursorBlink:true, scrollback:8000, allowProposedApi:true,
+    // scrollback: era 8000 (8× el default de xterm). Con 19 pestañas abiertas eso
+    // es memoria del navegador que nadie mira: la charla completa se lee en el
+    // visor de la sesión, acá alcanza con poder subir un rato (19-ago-2026).
+    cursorBlink:true, scrollback:3000, allowProposedApi:true,
     theme:{
       background:"#1E1D1B", foreground:"#E8E6DC", cursor:"#2D9CDB",
       cursorAccent:"#1E1D1B", selectionBackground:"rgba(45,156,219,.35)"
@@ -2470,7 +2534,7 @@ function abrirTab(id){
   term.onResize(({cols, rows}) => fetch(`/api/term/${id}/resize`, {
     method:"POST", body: JSON.stringify({cols, rows})
   }).catch(()=>{}));
-  abiertas[id] = {term, fit, es:null, box};
+  abiertas[id] = {term, fit, es:null, box, pos:null};   // pos: hasta qué byte tenemos
   activar(id);   // conecta el stream (y corta el de la pestaña que deja atrás)
 }
 
