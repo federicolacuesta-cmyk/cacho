@@ -22,8 +22,7 @@ PIN por token UNA vez y queda guardado en ~/.cacho_token (0600): un solo lugar d
 dispositivos que Cacho recuerda.
 
 Uso:
-  python3 cacho_lanzar.py "<prompt para la sesión>"          # proyecto = dir actual
-  python3 cacho_lanzar.py "<prompt>" /ruta/al/proyecto        # o el que le pases
+  python3 cacho_lanzar.py "<prompt para la sesión>" [area]    # proyecto = dir actual
 Salida: exit 0 si la pestaña quedó creada con el prompt tipeado; exit != 0 si no se pudo
 (el caller decide el fallback, p. ej. una ventana de Terminal común).
 """
@@ -150,22 +149,77 @@ def pin():
     raise SystemExit("Sin PIN de Cacho (~/.cacho_pin no apareció)")
 
 
-def main():
-    if len(sys.argv) < 2 or not sys.argv[1].strip():
-        raise SystemExit('Uso: cacho_lanzar.py "<prompt>" [/ruta/al/proyecto]')
-    prompt = sys.argv[1].strip()
-    proyecto = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.getcwd()
+# Cuánto se espera cuando Cacho está lleno. Corto a propósito: si en un minuto nadie cerró
+# una pestaña, es que de verdad está lleno y seguir esperando no cambia nada.
+REINTENTOS_LLENO = 3
+ESPERA_LLENO_S = 20
 
+
+def crear_pestana(modelo="", area=""):
+    """Levanta Cacho si hace falta, crea la pestaña y devuelve su id.
+
+    `modelo`: pedido explícito para esta pestaña (p. ej. una cita premium que exige
+    Fable). Vacío = el default de la casa (~/.cacho_modelo, hoy Opus).
+
+    `area`: de quién es esta corrida (`areas.py`: cacho/carla/jaime/eterna/waldemar/xara).
+    Vale la pena declararla SIEMPRE que el que llama lo sepa, y acá lo sabe casi siempre:
+    la rutina de novedades de Google es de Jaime y el vigía de chats es de Carla, no hay
+    nada que deducir. Sin esto, Cacho le adivinaba el área contando palabras del prompt
+    y lo que no reconocía caía en Cacho por descarte — o sea que la tira mostraba de
+    Cacho trabajo que era de otro, y sin ningún error a la vista. Vacío = que la
+    clasifique la máquina, como siempre (queda para el que de verdad no sepa).
+
+    Está separado de `tipear()` porque hay dos ritmos distintos: crear la pestaña
+    es instantáneo, pero después hay que esperar ~30 s a que el CLI de `claude`
+    levante para poder escribirle. Quien abre una tarea desde una PANTALLA (el
+    panel de pendientes del monitor) necesita contestarle al navegador ya mismo y
+    dejar el tipeo para un hilo de fondo; si esperara los 30 s, el clic parece
+    colgado y el usuario lo toca de nuevo.
+    """
     if not ping(silencioso=True) and not levantar_server():
-        raise SystemExit("El server de Cacho no levanta (ver %s)" % LOG)
-
-    r = _post("/api/term/new?cwd=%s" % quote(proyecto))
+        raise RuntimeError("El server de Cacho no levanta (ver %s)" % LOG)
+    ruta = "/api/term/new?cwd=%s" % quote(os.getcwd())
+    if modelo:
+        ruta += "&modelo=%s" % quote(modelo)
+    if area:
+        ruta += "&area=%s" % quote(area)
+    # El 429 ("ya hay N pestañas abiertas") es TRANSITORIO por definición: alguien cierra
+    # una y hay lugar. Hasta el 29-ago-2026 se propagaba como cualquier otro error y la
+    # rutina moría con un traceback de urllib — el trabajo NO se hacía y nadie se enteraba
+    # hasta que `chequear_launchd` lo cantaba a las 11:40, sin decir la causa. Pasó ese
+    # mismo día con TRES jobs: enriquecer-supervisores (06:05), monitor-base-local (06:08)
+    # y vigia-cotizador. Se arregla acá, en el lanzador, y no en cada uno de los 14
+    # llamadores. El reintento va SÓLO en esta llamada, nunca en `_post`: el otro 429 del
+    # server es el castigo por PIN equivocado, y ahí insistir es exactamente lo contrario
+    # de lo que hay que hacer.
+    ultimo = None
+    for intento in range(1, REINTENTOS_LLENO + 1):
+        try:
+            r = _post(ruta)
+            break
+        except urllib.error.HTTPError as e:
+            if e.code != 429:
+                raise
+            ultimo = e
+            if intento < REINTENTOS_LLENO:
+                print("(Cacho lleno, reintento %d/%d en %ds)"
+                      % (intento, REINTENTOS_LLENO, ESPERA_LLENO_S), file=sys.stderr)
+                time.sleep(ESPERA_LLENO_S)
+    else:
+        # en criollo: el que lee esto es el que mira el log de un job que no corrió
+        raise RuntimeError(
+            "Cacho está lleno de pestañas y no se liberó ninguna en %d s: la rutina no "
+            "pudo abrir la suya. Cerrá pestañas con la ✕ y volvé a correrla. (%s)"
+            % (REINTENTOS_LLENO * ESPERA_LLENO_S, ultimo))
     tid = r.get("id")
     if not tid:
-        raise SystemExit("Cacho no devolvió id de pestaña: %r" % r)
-    print(f"pestaña {tid} creada; esperando que levante claude ({ESPERA_CLAUDE_S}s)…")
-    time.sleep(ESPERA_CLAUDE_S)
+        raise RuntimeError("Cacho no devolvió id de pestaña: %r" % r)
+    return tid
 
+
+def tipear(tid, prompt, esperar=ESPERA_CLAUDE_S):
+    """Le pega el prompt a la pestaña `tid` y manda el Enter."""
+    time.sleep(esperar)
     # pegar el prompt con BRACKETED PASTE (entra atómico: tipearlo rápido en el TUI
     # de claude COME espacios) y el Enter va en un write aparte, un toque después,
     # para que el TUI ya haya digerido el texto.
@@ -173,12 +227,36 @@ def main():
     d = base64.b64encode(("\x1b[200~" + texto + "\x1b[201~").encode()).decode()
     rr = _post("/api/term/%s/input" % tid, body=json.dumps({"d": d}).encode())
     if not rr.get("ok"):
-        raise SystemExit("No pude tipear el prompt en la pestaña: %r" % rr)
+        raise RuntimeError("No pude tipear el prompt en la pestaña: %r" % rr)
     time.sleep(1.5)
     rr = _post("/api/term/%s/input" % tid,
                body=json.dumps({"d": base64.b64encode(b"\r").decode()}).encode())
     if not rr.get("ok"):
-        raise SystemExit("No pude mandar el Enter en la pestaña: %r" % rr)
+        raise RuntimeError("No pude mandar el Enter en la pestaña: %r" % rr)
+    return True
+
+
+def lanzar(prompt, area=""):
+    """Crea la pestaña y le deja el prompt corriendo. Devuelve el id de pestaña."""
+    tid = crear_pestana(area=area)
+    tipear(tid, prompt)
+    return tid
+
+
+def main():
+    if len(sys.argv) < 2 or not sys.argv[1].strip():
+        raise SystemExit('Uso: cacho_lanzar.py "<prompt>" [area]')
+    # El área va como 2º argumento POSICIONAL y opcional: los seis llamadores de hoy le
+    # pasan un solo argumento y tienen que seguir andando sin tocarlos. Un área que el
+    # server no conoce lo hace fallar con 400 en vez de crear la pestaña — es lo que se
+    # quiere: un typo en un plist tiene que gritar, no clasificar mal en silencio.
+    area = sys.argv[2].strip() if len(sys.argv) > 2 else ""
+    try:
+        tid = crear_pestana(area=area)
+        print(f"pestaña {tid} creada; esperando que levante claude ({ESPERA_CLAUDE_S}s)…")
+        tipear(tid, sys.argv[1].strip())
+    except RuntimeError as e:
+        raise SystemExit(str(e))
     print(f"OK — tarea corriendo en Cacho (pestaña {tid}).")
 
 

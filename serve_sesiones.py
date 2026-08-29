@@ -58,6 +58,23 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Empty, Queue
 from urllib.parse import parse_qs, urlencode, urlparse
 
+# `areas.py` vive en `tools/` en este repo y en la RAÍZ del repo público de Cacho (que se
+# arma con publicar_cacho.py y aplana el árbol). Se prueban los dos lugares en vez de dar por
+# hecho uno: si el import fallara, Cacho no abriría — y el repo público es el que menos ojos
+# tiene encima para darse cuenta.
+_AQUI = os.path.dirname(os.path.abspath(__file__))
+for _d in (os.path.dirname(_AQUI), _AQUI):
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
+import areas                                # noqa: E402 — las áreas: cara, color, palabras
+import costo_sesion
+# El uso del plan (tubo de la barra lateral). Guardado: en el repo público de Cacho
+# este módulo no viaja, y sin él Cacho tiene que abrir igual — muestra "sin dato".
+try:
+    import uso_claude
+except ImportError:
+    uso_claude = None
+
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 CARPETA_PROYECTOS = os.path.expanduser("~/Claude/Projects")
 AQUI = os.path.dirname(os.path.abspath(__file__))
@@ -379,6 +396,187 @@ def _texto_de(content):
     return None, None
 
 
+_RE_ARCHIVO = re.compile(
+    r"[\w.\-]+\.(py|js|ts|json|md|html|css|liquid|sh|sql|sqlite|csv|xlsx|png|jpe?g|"
+    r"mp4|pdf|plist|txt|yml|yaml|jsonl)\b")
+# comandos que no dicen nada de qué se está haciendo
+_CMD_MUDOS = {"cd", "cat", "echo", "printf", "true", "sudo", "time", "ls", "pwd", "env",
+              "for", "do", "done", "if", "then", "else", "fi", "while", "read", "set"}
+
+
+def _objeto_de_bash(cmd):
+    """Lo más parlante de una línea de comando: el archivo que toca, y si no,
+    el programa que corre. Devuelve "" si no hay nada legible — antes salía el
+    primer token pelado y en la barra se leían cosas como "cat" o media ruta."""
+    m = _RE_ARCHIVO.search(cmd)
+    if m:
+        return m.group(0)[:26]
+    for tok in cmd.split():
+        limpio = tok.strip("\"'`(){}$")
+        # los programas van en minúscula: si empieza con mayúscula es un pedazo
+        # de ruta o de texto, no un comando
+        if ("=" in limpio or "/" in limpio or len(limpio) < 3
+                or limpio in _CMD_MUDOS or not limpio.isascii()
+                or not limpio[0].islower()):
+            continue      # dos letras sueltas ("vs") son pedazos de comando, no un programa
+        return limpio[:20]
+    return ""
+
+
+def _pistas_de(content):
+    """(herramientas, objetos) de un mensaje del asistente.
+
+    Los OBJETOS son lo concreto que se está tocando —el archivo, el programa, el
+    dominio—, que es lo que hace entendible una charla mirándola de reojo desde
+    la barra: "editando serve_sesiones.py" dice muchísimo más que "Edit". Los
+    archivos van primero: son los que mejor identifican de qué se trata."""
+    if not isinstance(content, list):
+        return [], []
+    tools, archivos, otros = [], [], []
+    for b in content:
+        if not isinstance(b, dict) or b.get("type") != "tool_use":
+            continue
+        nombre = b.get("name", "?")
+        tools.append(nombre)
+        inp = b.get("input")
+        if not isinstance(inp, dict):
+            continue
+        ruta = inp.get("file_path") or inp.get("notebook_path") or inp.get("path")
+        if ruta:
+            archivos.append(os.path.basename(str(ruta).rstrip("/"))[:26] or str(ruta)[:26])
+            continue
+        if nombre == "Bash" and inp.get("command"):
+            obj = _objeto_de_bash(str(inp["command"]))
+            if obj:
+                (archivos if _RE_ARCHIVO.fullmatch(obj) else otros).append(obj)
+            continue
+        url = inp.get("url")
+        if url:
+            otros.append(re.sub(r"^https?://(www\.)?", "", str(url)).split("/")[0][:28])
+            continue
+        for k in ("pattern", "query", "description"):
+            if inp.get(k):
+                otros.append(_limpiar(str(inp[k]), 26))
+                break
+    return tools, archivos + otros
+
+
+# --- De qué va la charla (tema + ícono) ------------------------------------
+# La barra tenía una sola pista de contenido: el título que escribe el CLI una
+# vez, al principio, y que ya no vuelve a cambiar (verificado 21-ago-2026: en un
+# transcript hay 31 líneas `ai-title` y las 31 dicen lo mismo). Una charla que
+# arranca en una cosa y termina en otra queda rotulada con la primera para
+# siempre, y a veces con dos palabras ("Images") que a los tres días no
+# significan nada. Esto le pone al lado un TEMA deducido de lo último que pasó,
+# con su ícono, y avisa cuando el tema de ahora no es el del arranque.
+#
+# Es deliberadamente tonto —contar palabras, sin modelo—: corre en cada lectura
+# de transcript, tiene que ser instantáneo y sobre todo NO puede inventar. Si no
+# reconoce nada, no muestra nada, que es mejor que rotular mal.
+TEMAS_BASE = [
+    ("🚓", "auditoría", ["auditor", "policía", "policia", "vulnerab", "seguridad",
+                         "revisar a fondo", "code review", "code-review", "revisión"]),
+    ("🐛", "arreglo", ["error", "falla", "fallo", "bug", "roto", "rota", "no anda",
+                       "traceback", "excepción", "arreglar", "arreglá", "se cuelga"]),
+    ("🧮", "números", ["contab", "factur", "banco", "bancari", "iva", "costo",
+                       "presupuesto", "caja", "balance", "gasto", "cobranza", "saldo"]),
+    ("📊", "informes", ["informe", "reporte", "brief", "resumen", "dashboard",
+                        "panel", "monitor", "métrica", "planilla"]),
+    ("🗃️", "datos", ["sqlite", "sql", "select ", "base de datos", "consulta",
+                     "tabla", "query", "join ", "csv"]),
+    ("⚙️", "procesos", ["launchd", "plist", "rutina", "cron", "automat", "job",
+                        "sync", "daemon", "servidor", "server", "puerto"]),
+    ("🌐", "web", ["theme", "liquid", "css", "html", "landing", "seo", "sitio",
+                   "página web", "navegador", "chrome"]),
+    ("📣", "difusión", ["campaña", "anuncio", "creativ", "publicid", " ads",
+                        "pauta", "posteo", "reel", "audiencia"]),
+    ("💬", "mensajes", ["whatsapp", "mensaje", "chat", "mail", "correo",
+                        "notificación", "aviso"]),
+    ("🖼️", "imagen", [".png", ".jpg", "imagen", "foto", "diseño", "render",
+                      "video", ".mp4", "logo"]),
+    ("📝", "escritura", ["documento", "redact", "artículo", "nota ", ".md",
+                         "texto", "escribir"]),
+    ("🧑‍💻", "código", [".py", ".js", "función", "script", "refactor", "código",
+                       "commit", "git "]),
+]
+# Ampliable sin tocar código: mismo formato, en el estado de la app. Lo de acá
+# arriba es vocabulario general; el de cada uno (nombres de sistemas, de gente,
+# de proyectos) va en ese archivo, que no viaja con el programa.
+TEMAS_FILE = os.path.expanduser("~/Library/Application Support/Cacho/temas.json")
+_temas_cache = {"mtime": -1, "datos": []}
+
+
+def _temas():
+    """TEMAS_BASE + los del archivo del usuario, que valen DOBLE: nombran cosas
+    de la casa ("cristales", "franquicias") y por eso aciertan más que una
+    palabra genérica que puede aparecer en cualquier charla."""
+    try:
+        m = os.path.getmtime(TEMAS_FILE)
+    except OSError:
+        m = 0
+    if m != _temas_cache["mtime"]:
+        propios = []
+        if m:
+            try:
+                with open(TEMAS_FILE, encoding="utf-8") as fh:
+                    d = json.load(fh)
+                for t in (d.get("temas") or []):
+                    palabras = [str(p).lower() for p in (t.get("palabras") or []) if p]
+                    if t.get("nombre") and palabras:
+                        propios.append((t.get("icono") or "•", str(t["nombre"]),
+                                        palabras, 2))
+            except Exception as e:
+                print(f"⚠️ temas.json ilegible, sigo con los de fábrica: {e}", file=sys.stderr)
+                propios = []
+        _temas_cache.update(
+            mtime=m, datos=propios + [(i, n, p, 1) for i, n, p in TEMAS_BASE])
+    return _temas_cache["datos"]
+
+
+def _tema_de(texto):
+    """(icono, nombre) del tema que más pesa en ese texto, o ("", "")."""
+    if not texto:
+        return "", ""
+    t = texto.lower()
+    mejor, puntaje_mejor = None, 0
+    for icono, nombre, palabras, peso in _temas():
+        p = sum(t.count(w) for w in palabras) * peso
+        if p > puntaje_mejor:
+            mejor, puntaje_mejor = (icono, nombre), p
+    if not mejor or puntaje_mejor < 3:
+        return "", ""      # una mención suelta no es un tema
+    return mejor
+
+
+# Cuántos mensajes del final miro para decir "de qué va ahora". Pocos y la charla
+# parece cambiar de tema cada vez que se contesta un "dale"; muchos y no se entera
+# nunca de que cambió.
+VENTANA_TEMA = 24
+CONFIRMACIONES = {
+    "dale", "si", "sí", "ok", "oka", "okey", "listo", "bien", "perfecto", "genial",
+    "gracias", "no", "nop", "sip", "claro", "exacto", "seguí", "segui", "continuá",
+    "continua", "continuá", "andá", "anda", "hacelo", "dale gracias", "buenísimo",
+    "buenisimo", "gracias!", "ahora sí", "ahora si", "bárbaro", "barbaro", "gracias.",
+}
+
+_VERBOS = [
+    (("Edit", "Write", "NotebookEdit", "MultiEdit"), "✎ editando"),
+    (("Bash", "BashOutput"), "⌘ corriendo"),
+    (("Read", "Grep", "Glob", "Agent", "Task"), "👀 mirando"),
+    (("WebSearch", "WebFetch"), "🔎 buscando"),
+]
+
+
+def _verbo_de(tools):
+    for nombres, verbo in _VERBOS:
+        if any(t in nombres for t in tools):
+            return verbo
+    for t in tools:
+        if t.startswith("mcp__"):
+            return "🔌 " + t.split("__")[1][:14]
+    return ""
+
+
 def _parse_linea(line):
     try:
         return json.loads(line)
@@ -411,13 +609,25 @@ def _leer_sesion(path):
         "cwd": "", "branch": "", "titulo": "", "primer_msg": "",
         "primer_ts": "", "ultimo_quien": "", "ultimo_txt": "",
         "mtime": st.st_mtime, "auto": False,
+        # de qué va AHORA (ver el bloque de temas, más arriba)
+        "icono": "", "tema": "", "tema_ini": "", "area": areas.DEFECTO,
+        "contexto": "", "pedido": "",
+        # cuánto pesa arrastrar esta charla (24-ago-2026). Sale de tail_lines,
+        # que ya se leyó: no agrega ni una lectura de disco al refresco del panel.
+        "ctx_tokens": 0, "peso": costo_sesion.VERDE, "peso_nota": "",
     }
 
+    iniciales = []      # el arranque de la charla, para saber después si mutó
     for line in head_lines:
         d = _parse_linea(line)
         if not d:
             continue
         t = d.get("type")
+        if (t in ("user", "assistant") and not d.get("isMeta")
+                and not d.get("isSidechain") and len(iniciales) < VENTANA_TEMA):
+            txt_ini, _ = _texto_de((d.get("message") or {}).get("content"))
+            if txt_ini:
+                iniciales.append(_limpiar(txt_ini, 400))
         if t == "ai-title" and d.get("aiTitle"):
             s["titulo"] = d["aiTitle"]
         if d.get("cwd") and not s["cwd"]:
@@ -435,6 +645,9 @@ def _leer_sesion(path):
                 if limpio:
                     s["primer_msg"] = limpio
 
+    # Lo último que pasó, para deducir el tema de ahora: texto de los últimos
+    # mensajes, la herramienta más reciente (el verbo) y los archivos tocados.
+    recientes, tools_rec, objs_rec = [], [], []
     for line in reversed(tail_lines or head_lines):
         d = _parse_linea(line)
         if not d:
@@ -451,24 +664,66 @@ def _leer_sesion(path):
             s["cwd"] = d["cwd"]
         if d.get("gitBranch") and not s["branch"]:
             s["branch"] = d["gitBranch"]
+        if d.get("type") not in ("user", "assistant") or d.get("isMeta") or d.get("isSidechain"):
+            continue
+        contenido = (d.get("message") or {}).get("content")
+        txt, tools = _texto_de(contenido)
+        if len(recientes) < VENTANA_TEMA:
+            if txt:
+                recientes.append(_limpiar(txt, 400))
+            if d.get("type") == "assistant":
+                herr, objs = _pistas_de(contenido)
+                if herr and not tools_rec:
+                    tools_rec = herr          # la más nueva manda: es lo que hace ahora
+                for o in objs:
+                    if o and o not in objs_rec and len(objs_rec) < 3:
+                        objs_rec.append(o)
+        # EL PEDIDO: el último mensaje tuyo que pide algo, no el último cualquiera.
+        # "dale", "sí", "gracias" no explican nada de la charla, y son la mitad de
+        # lo que uno escribe.
+        if d.get("type") == "user" and txt and not s["pedido"]:
+            limpio = _limpiar(txt, 150)
+            # "toolu_" = eco de una herramienta que volvió por el canal del
+            # usuario, no algo que haya escrito nadie
+            if (len(limpio) >= 14 and "toolu_" not in limpio
+                    and limpio.lower().strip(" .!¡") not in CONFIRMACIONES):
+                s["pedido"] = limpio
         if s["ultimo_quien"]:
             continue
-        if d.get("type") in ("user", "assistant") and not d.get("isMeta") and not d.get("isSidechain"):
-            txt, tools = _texto_de((d.get("message") or {}).get("content"))
-            if txt:
-                limpio = _limpiar(txt)
-                if limpio:
-                    s["ultimo_quien"] = "Claude" if d["type"] == "assistant" else "Vos"
-                    s["ultimo_txt"] = limpio
-            elif tools:
-                s["ultimo_quien"] = "Claude"
-                s["ultimo_txt"] = "⚙ " + ", ".join(dict.fromkeys(tools))
+        if txt:
+            limpio = _limpiar(txt)
+            if limpio:
+                s["ultimo_quien"] = "Claude" if d["type"] == "assistant" else "Vos"
+                s["ultimo_txt"] = limpio
+        elif tools:
+            s["ultimo_quien"] = "Claude"
+            s["ultimo_txt"] = "⚙ " + ", ".join(dict.fromkeys(tools))
 
     if not (s["primer_msg"] or s["titulo"]):
         resultado = None
     else:
         if not s["titulo"]:
             s["titulo"] = s["primer_msg"]
+        # tema del arranque vs. tema de ahora. Se comparan para poder avisar que
+        # la charla se fue a otro lado (que es cuando el título viejo engaña).
+        arranque = s["titulo"] + " " + " ".join(iniciales)
+        _, s["tema_ini"] = _tema_de(arranque)
+        s["icono"], s["tema"] = _tema_de(" ".join(recientes) + " " + " ".join(objs_rec))
+        if not s["tema"]:                     # sin señal reciente, vale la del arranque
+            s["icono"], s["tema"] = _tema_de(arranque)
+        # De qué ÁREA es esta sesión (23-ago-2026). Del mismo texto que el tema, porque es
+        # lo que la sesión está haciendo AHORA: una charla que arrancó en pauta y terminó en
+        # el banco es de Xara, no de Jaime. Lo que decide de verdad es el arranque + lo
+        # reciente juntos; con lo reciente solo, un «dale, gracias» al final movía la sesión
+        # de área. Si el usuario la corrigió a mano, esto queda pisado en `_aplicar_meta`.
+        s["area"] = areas.de_texto(arranque + " " + " ".join(recientes) + " "
+                                   + " ".join(objs_rec))
+        verbo = _verbo_de(tools_rec)
+        partes = [p for p in (verbo, ", ".join(objs_rec[:2])) if p]
+        s["contexto"] = " ".join(partes)
+        s["ctx_tokens"] = costo_sesion.contexto_de_lineas(tail_lines or head_lines)
+        s["peso"] = costo_sesion.veredicto(s["ctx_tokens"])
+        s["peso_nota"] = costo_sesion.en_criollo(s["ctx_tokens"])
         resultado = s
 
     with _cache_lock:
@@ -607,6 +862,15 @@ def _proyecto_lindo(cwd):
     return os.path.basename(cwd.rstrip("/")) or cwd
 
 
+# El proyecto donde vive este programa. Casi todas las charlas son de ahí, así que
+# repetir su nombre en cada renglón de la barra ocupa el lugar donde iría algo que
+# sí distingue una charla de otra: la barra solo lo escribe cuando NO es este.
+# Se deduce de dónde está el archivo, para que la copia de otra máquina —u otra
+# persona— acierte sola sin que nadie configure nada.
+PROY_CASA = _proyecto_lindo(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
+
+
 def _iso_a_epoch(ts):
     try:
         return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
@@ -619,7 +883,44 @@ def _iso_a_epoch(ts):
 # Procesos `claude` vivos fuera de la app
 # ---------------------------------------------------------------------------
 
-_proc_cache = {}  # pid -> {tty, cwd, start}; tty/cwd/start no cambian en vida del proceso
+_proc_cache = {}  # pid -> {tty, cwd, start, sid}; nada de eso cambia en vida del proceso
+
+# Subcomandos del CLI que NO son una charla: el proceso se llama `claude` igual y
+# `pgrep -x claude` lo trae, pero no tiene transcript. Sin esta lista, el emparejado
+# de abajo le regalaba ese proceso a la sesión libre más cercana de la misma carpeta
+# y una charla TERMINADA figuraba viva en «En Terminal (afuera)» para siempre
+# (26-ago-2026: `claude remote-control` del tmux `claude-rc`, prendido desde el martes,
+# mantenía "Brief Reunion Supervisores" —cerrada hacía 22 h— colgada en la barra).
+NO_ES_CHARLA = {
+    "remote-control", "mcp", "config", "doctor", "update", "install",
+    "migrate-installer", "plugin", "setup-token", "agents", "monitor",
+}
+
+
+def _subcomando_y_sid(pid):
+    """(subcomando, session-id) de la línea de comandos del proceso.
+
+    El subcomando es el PRIMER argumento, y solo si no es una opción: así lo pide el
+    CLI (`claude remote-control …`). Mirar "el primer no-flag" en cualquier posición
+    sería adivinar — el valor de un flag (`--session-id <uuid>`, `--model <x>`) también
+    es un token sin guiones. El session-id se lee del `--session-id` cuando está:
+    emparejar por él es exacto y no adivina.
+    """
+    try:
+        linea = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                               capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception as e:
+        print(f"⚠️ no pude leer la línea de comandos del proceso claude {pid}: {e}",
+              file=sys.stderr)
+        return "", ""
+    args = linea.split()[1:]
+    sub = args[0] if args and not args[0].startswith("-") else ""
+    sid = ""
+    if "--session-id" in args:
+        i = args.index("--session-id")
+        if i + 1 < len(args):
+            sid = args[i + 1]
+    return sub, sid
 
 
 def procesos_claude(ttys_excluidos):
@@ -660,13 +961,17 @@ def procesos_claude(ttys_excluidos):
                     if line.startswith("n"):
                         cwd = line[1:]
                         break
-                info = {"tty": tty, "cwd": cwd, "start": start}
+                sub, sid = _subcomando_y_sid(pid)
+                info = {"tty": tty, "cwd": cwd, "start": start,
+                        "sid": sid, "sub": sub}
                 _proc_cache[pid] = info
             except Exception as e:
                 print(f"⚠️ no pude leer ps/lsof del proceso claude {pid} (lo salteo): {e}", file=sys.stderr)
                 continue
         if info["tty"] in ttys_excluidos:
             continue  # es una pestaña nuestra
+        if info.get("sub") in NO_ES_CHARLA:
+            continue  # es el CLI haciendo otra cosa, no una charla con transcript
         procs.append({"pid": pid, **info})
     return procs
 
@@ -749,7 +1054,10 @@ def arranque_stream(buf, escritos, desde):
 
 
 class TermSession:
-    def __init__(self, cwd, resume_id=""):
+    def __init__(self, cwd, resume_id="", modelo=""):
+        # `modelo`: pedido explícito para ESTA pestaña (p. ej. una cita premium que
+        # necesita Fable). Vacío = el default de la máquina (~/.cacho_modelo).
+        self.modelo_pedido = modelo
         self.id = uuid.uuid4().hex[:8]
         self.cwd = cwd
         self.creado = time.time()
@@ -814,11 +1122,10 @@ class TermSession:
             claude = "claude --session-id " + self.sid_propio
         else:
             claude = "claude"
-        # Si existe ~/.cacho_modelo, las pestañas nuevas arrancan con ese modelo. Sirve
-        # para que un vigía externo cambie de modelo solo (p. ej. bajar a uno más barato
-        # cuando se agota el cupo del más caro, y volver cuando se renueva) sin tocar el
-        # server. Sin archivo, el comportamiento es el de siempre: el default de la máquina.
-        modelo = _modelo_preferido()
+        # El modelo: primero el pedido explícito de la pestaña, si no
+        # ~/.cacho_modelo (tu default para toda pestaña nueva, si lo escribiste).
+        # Sin archivo, el comportamiento es el de siempre: el default de la máquina.
+        modelo = self.modelo_pedido or _modelo_preferido()
         if modelo:
             # entre comillas SIEMPRE: el sufijo de contexto va entre corchetes
             # (`claude-opus-5[1m]`) y zsh lo toma como glob → "no matches found".
@@ -1010,6 +1317,19 @@ def _aplicar_meta(item, sid, meta):
     item["sid"] = sid or ""
     item["fija"] = bool(m.get("fija"))
     item["orden"] = m.get("orden")
+    # El área que puso el usuario a mano gana siempre sobre la que dedujo el clasificador, y no se
+    # vuelve a discutir: `de_texto` corre en cada lectura (cada 4 s) y sin esto le movería la
+    # sesión de área abajo de la mano justo después de corregirla.
+    # `areas.valida` y no `m["area"]` a secas: si mañana se saca un área de `areas.py`, las
+    # sesiones que el usuario había mandado ahí quedarían apuntando a una clave que ya no existe —
+    # sin cara, sin color y fuera de todos los filtros, sin un solo error. Con la validación,
+    # esas vuelven solas a manos del clasificador.
+    guardada = areas.valida(m.get("area") or "")
+    if guardada:
+        item["area"] = guardada
+        item["area_propia"] = True
+    else:
+        item.setdefault("area", areas.DEFECTO)
     if m.get("nombre"):
         item["titulo"] = m["nombre"]
         item["renombrada"] = True
@@ -1120,6 +1440,19 @@ def estado_general():
             "hace_seg": int(ahora - (p["mtime"] if p else t.last_out)),
             "ultimo_quien": p["ultimo_quien"] if p else "",
             "ultimo_txt": p["ultimo_txt"] if p else "",
+            "icono": p["icono"] if p else "",
+            "tema": p["tema"] if p else "",
+            "area": (p or {}).get("area", areas.DEFECTO),
+            "tema_ini": p["tema_ini"] if p else "",
+            "contexto": p["contexto"] if p else "",
+            "pedido": p["pedido"] if p else "",
+            # El semáforo de peso también en las pestañas VIVAS. Sin esto el
+            # cartel rojo con «Nueva» (que solo se dibuja en la activa) no
+            # aparecía nunca donde importa: las de la app eran las únicas sin
+            # el dato (24-ago-2026).
+            "ctx_tokens": (p or {}).get("ctx_tokens", 0),
+            "peso": (p or {}).get("peso", costo_sesion.VERDE),
+            "peso_nota": (p or {}).get("peso_nota", ""),
         }, t.transcript_id, meta))
 
     ttys_mios = {t.tty.replace("/dev/", "") for t in tabs}
@@ -1142,10 +1475,20 @@ def estado_general():
         if pid and pid in vivos and pid not in asignados and vivos[pid]["cwd"] == s["cwd"]:
             s.update({"viva": True, "tty": vivos[pid]["tty"], "pid": pid})
             asignados.add(pid)
-    # 2) procesos nuevos: a la sesión libre de la misma carpeta cuyo inicio
-    #    más se acerque al arranque del proceso
+    # 2) el proceso que trae `--session-id` DICE cuál es la suya: se le cree y no se
+    #    adivina. (Un `claude --resume` sin ese flag sigue cayendo en la heurística
+    #    de abajo, que es para lo que se escribió.)
+    por_id = {s["id"]: s for s in afuera}
     for pid, pr in vivos.items():
-        if pid in asignados:
+        s = por_id.get(pr.get("sid") or "")
+        if s and not s["viva"] and pid not in asignados:
+            s.update({"viva": True, "tty": pr["tty"], "pid": pid})
+            _mapeo_pid[s["id"]] = pid
+            asignados.add(pid)
+    # 3) procesos nuevos sin session-id: a la sesión libre de la misma carpeta cuyo
+    #    inicio más se acerque al arranque del proceso
+    for pid, pr in vivos.items():
+        if pid in asignados or pr.get("sid"):
             continue
         cands = [s for s in afuera if not s["viva"] and s["cwd"] == pr["cwd"]]
         if not cands:
@@ -1173,7 +1516,16 @@ def estado_general():
     orden = {"trabajando": 0, "esperando": 1, "terminada": 2}
     afuera.sort(key=lambda s: (orden[s["estado"]], s["hace_seg"]))
 
-    return {"tabs": tabs_json, "afuera": afuera, "proyectos": proyectos()}
+    return {"tabs": tabs_json, "afuera": afuera, "proyectos": proyectos(),
+            "casa": PROY_CASA,
+            # Las áreas viajan con el estado y no clavadas en el HTML: así
+            # tocar un color o un rol en areas.py se ve sin reiniciar el server.
+            "areas": areas.para_el_front(),
+            # Cuál es el área por defecto también viaja: escrita a mano en el JS,
+            # el día que se renombre la clave el front pediría una que no existe y
+            # las sesiones sin área se quedarían sin cara, sin color y fuera de todo
+            # filtro — sin un solo error. Es el error nº 2 de la lista de la casa.
+            "area_defecto": areas.DEFECTO}
 
 
 def proyectos():
@@ -1545,6 +1897,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(estado_general())
             except Exception as e:
                 self._json({"error": repr(e)}, 500)
+        elif ruta == "/api/uso":
+            # % consumido del plan Max (dato oficial, cacheado 5 min en uso_claude).
+            # Sin dato se dice "sin dato": nunca se estima ni se inventa (regla de la casa).
+            if uso_claude is None:
+                self._json({"ok": False, "error": "uso_claude.py no está en esta instalación"})
+            else:
+                try:
+                    self._json(uso_claude.uso())
+                except Exception as e:
+                    self._json({"ok": False, "error": repr(e)})
         elif ruta.startswith("/api/sesion/") and ruta.endswith("/ver"):
             sid = ruta.split("/")[3]
             if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", sid):
@@ -1804,6 +2166,14 @@ class Handler(BaseHTTPRequestHandler):
                     campos["orden"] = int(d["orden"])
                 except (TypeError, ValueError):
                     campos["orden"] = None
+            if "area" in d:
+                # Corregir a mano a qué área es una sesión. Vacío = devolvérsela al
+                # clasificador, que es lo que hace que esto no se vuelva un archivo manual:
+                # la máquina propone, el usuario corrige, y siempre se puede volver atrás.
+                a = areas.valida(d["area"]) if d["area"] else None
+                if d["area"] and not a:
+                    return self._json({"error": "área que no existe"}, 400)
+                campos["area"] = a
             if not campos:
                 return self._json({"error": "nada que guardar"}, 400)
             return self._json({"ok": True, "meta": _meta_set(sid, campos)})
@@ -1836,12 +2206,50 @@ class Handler(BaseHTTPRequestHandler):
             # Tope de pestañas: cada una es un zsh + un `claude` + un pty. Sin
             # techo, un cliente en bucle (un script con un error, no hace falta
             # mala intención) deja la máquina sin procesos ni memoria.
+            #
+            # Antes de medir el tope, COSECHAR (29-ago-2026). La cosecha de muertas
+            # corría solo desde estado_general(), o sea cuando alguien MIRA la barra.
+            # De madrugada nadie mira Cacho: las pestañas de las rutinas nocturnas
+            # morían sin cosechar, el tope se medía contra una lista llena de
+            # cadáveres, y a las 6:05 les rebotaba un 429 a enriquecer-supervisores
+            # y monitor-base-local con la máquina casi vacía. Si tras la cosecha
+            # normal sigue lleno, segunda pasada sin gracia (los 15 min de gracia
+            # son cosmética de la barra; un 429 a una rutina de producción pesa
+            # más). Recién si hay MAX_TABS realmente VIVAS, el 429 es legítimo.
+            _cosechar_tabs(time.time())
+            with TABS_LOCK:
+                lleno = len(TABS) >= MAX_TABS
+            if lleno:
+                _cosechar_tabs(time.time(), gracia=0)
             with TABS_LOCK:
                 if len(TABS) >= MAX_TABS:
                     return self._json(
                         {"error": f"ya hay {MAX_TABS} pestañas abiertas; "
                                   "cerrá alguna con la ✕"}, 429)
-            t = TermSession(cwd, resume_id=resume)
+            # modelo explícito para esta pestaña (lo usa citas_cacho para las premium).
+            # Se valida acá con la misma vara que ~/.cacho_modelo: termina en un comando.
+            modelo = q.get("modelo", [""])[0]
+            if modelo and not _MODELO_OK.match(modelo):
+                return self._json({"error": "modelo inválido"}, 400)
+            # ── El ÁREA se DECLARA al nacer (29-ago-2026) ────────────────────────────
+            # Antes TODA sesión nacía pelada y `areas.de_texto()` le adivinaba el área
+            # contando palabras del transcript, cada 4 s. El problema no es que a veces
+            # se equivoque: es que cuando se equivoca NO LO DICE — lo que no reconoce
+            # cae en Cacho por descarte, así que Cacho parecía lleno de cosas que no
+            # eran suyas y la tira mentía sin un solo error a la vista.
+            # RAÍZ: se adivinaba un dato que quien abre la pestaña YA SABE. el usuario parado
+            # en una cara lo sabe; una rutina que corre para una sola área también. Es
+            # la misma regla del feeder: a la máquina no se le pide lo que ya sabe.
+            # Ojo con el alcance: esto sólo tiene dónde anotarse si la pestaña nace con
+            # `--session-id` (la meta va por sid). En una máquina con un `claude` viejo
+            # la pestaña sale igual y el clasificador sigue trabajando como siempre —
+            # se pierde la precisión, no la sesión.
+            area = q.get("area", [""])[0]
+            if area and not areas.valida(area):
+                return self._json({"error": "área inválida"}, 400)
+            t = TermSession(cwd, resume_id=resume, modelo=modelo)
+            if area and t.transcript_id:
+                _meta_set(t.transcript_id, {"area": area})
             with TABS_LOCK:
                 TABS[t.id] = t
             return self._json({"id": t.id})
@@ -1876,6 +2284,48 @@ class Handler(BaseHTTPRequestHandler):
                     TABS.pop(tid, None)
                 return self._json({"ok": True})
             return self._json({"error": "no existe"}, 404)
+
+        if ruta == "/api/frente":
+            # Traer al frente la ventana de Cacho. Lo pide el front DESPUÉS de soltar un
+            # archivo y SOLO si la ventana no tiene el foco del sistema
+            # (`document.hasFocus()` en falso). RAÍZ del problema: arrastrás desde el
+            # Finder —que es la app del frente— y macOS NO le da el foco de teclado a la
+            # ventana que recibe el drop. Ningún focus() de JavaScript puede arreglar eso:
+            # el foco de VENTANA lo maneja el sistema, no la página. Por eso escribías y
+            # las teclas se las llevaba el Finder, y había que dar un clic.
+            if self._ip not in ("127.0.0.1", "::1"):
+                # desde el teléfono/Tailscale no hay ventana que levantar
+                return self._json({"ok": False, "msg": "no es local"})
+            guion = ("""
+tell application "Google Chrome"
+  set encontradas to {}
+  repeat with w in windows
+    try
+      if URL of active tab of w contains "127.0.0.1:%d" then set end of encontradas to (id of w)
+    end try
+  end repeat
+  if (count of encontradas) is 0 then return "no"
+  set p to window id (item 1 of encontradas)
+  try
+    set minimized of p to false
+  end try
+  activate
+  set index of p to 1
+  return "si"
+end tell""" % PORT)
+            try:
+                # Nunca cierra ni reordena nada más: sube la ventana y listo (el lanzador
+                # de Cacho.app sí cierra duplicados; acá no, esto corre con el usuario mirando).
+                r = subprocess.run(["osascript", "-e", guion], capture_output=True,
+                                   text=True, timeout=6)
+                ok = r.stdout.strip() == "si"
+                if not ok:
+                    print(f"⚠️ /api/frente no pudo levantar la ventana: "
+                          f"{r.stdout.strip()!r} {r.stderr.strip()!r}", file=sys.stderr)
+                return self._json({"ok": ok, "msg": r.stdout.strip() or r.stderr.strip()})
+            except Exception as e:
+                print(f"⚠️ /api/frente falló: {e!r}", file=sys.stderr)
+                return self._json({"ok": False, "msg": str(e)})
 
         if ruta == "/api/subir":
             # drag & drop de archivos: se guardan y se pega la ruta en la terminal
@@ -1927,17 +2377,18 @@ PAGINA_PIN = r"""<!doctype html>
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <meta name="apple-mobile-web-app-title" content="Cacho">
 <style>
+  /* misma paleta clara que la app (23-ago-2026): crema + coral */
   body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
-       background:#262624;color:#e8e6dc;font-family:-apple-system,system-ui,sans-serif}
+       background:#FAF9F5;color:#1F1E1B;font-family:-apple-system,system-ui,sans-serif}
   .caja{text-align:center;padding:32px}
   .caja img{width:96px;height:96px;border-radius:22px}
   h1{font-size:22px;margin:14px 0 2px}
-  p{color:#a8a698;margin:4px 0 18px;font-size:14px}
+  p{color:#6E6C64;margin:4px 0 18px;font-size:14px}
   input{font-size:26px;letter-spacing:8px;text-align:center;width:190px;padding:10px;
-        border-radius:12px;border:1px solid #4a483f;background:#1d1c1a;color:#e8e6dc}
+        border-radius:12px;border:1px solid #E3E0D5;background:#FFFFFF;color:#1F1E1B}
   button{display:block;margin:16px auto 0;font-size:16px;padding:10px 34px;border:0;
-         border-radius:12px;background:#c96442;color:#fff;font-weight:600}
-  .err{color:#ff8b6b;margin-top:12px;font-size:14px}
+         border-radius:12px;background:#C96442;color:#fff;font-weight:600}
+  .err{color:#B4331B;margin-top:12px;font-size:14px}
 </style>
 </head>
 <body>
@@ -1967,20 +2418,32 @@ PAGINA = r"""<!doctype html>
 <script src="/static/xterm.min.js"></script>
 <script src="/static/addon-fit.min.js"></script>
 <style>
+/* PALETA — la de claude.ai: crema de fondo y coral de acento (pedido del usuario
+   23-ago-2026: "no veo nada así"). Cacho es CLARO SIEMPRE, no sigue el modo
+   del sistema. La raíz del problema era esa: había una paleta clara acá y una
+   oscura colgada de `prefers-color-scheme`, y con la Mac en modo oscuro el usuario
+   nunca veía la clara — encima la barra y la ⌘K se forzaban oscuras a mano, así
+   que ni cambiando el modo del sistema se aclaraban. Un solo juego de colores,
+   sin bifurcación: lo que se ve acá es lo que hay.
+   ÚNICA excepción: --term-bg. La terminal va oscura a propósito (decisión del usuario
+   23-ago-2026) porque el texto de Claude Code viene con colores ANSI pensados
+   para fondo oscuro; aclararla obliga a cambiarle el tema al CLI también. */
 :root{
   --bg:#FAF9F5; --panel:#F0EEE6; --card:#FFFFFF; --borde:#E3E0D5;
-  --tinta:#1F1E1B; --gris:#6E6C64; --acento:#2D9CDB; --ocre:#B8860B;
+  --tinta:#1F1E1B; --gris:#6E6C64; --acento:#C96442; --ocre:#B8860B;
+  /* coral en rgb, para los tintes y los brillos que necesitan alfa */
+  --acento-rgb:201,100,66;
+  /* AZUL de "estás acá" (26-ago-2026, pedido del usuario). Antes la sesión abierta se
+     marcaba con el coral, que en esta barra ya dice otras tres cosas (el logo, el
+     botón de nueva, el punto de "trabajando"): el mismo color diciendo cuatro cosas
+     no señala ninguna. El azul no lo usa nada más, así que dónde estás parado se
+     encuentra de un vistazo sin leer. */
+  --aca:#2563EB; --aca-rgb:37,99,235;
   --term-bg:#1E1D1B;
   /* letra de display: el nombre "Cacho" y los títulos de sesión. Futura,
      elegida el 16-ago-2026 sobre otras 11 candidatas (antes era Georgia).
      Un solo lugar para cambiarla. */
   --display: Futura, "Century Gothic", system-ui, sans-serif;
-}
-@media (prefers-color-scheme: dark){
-  :root{
-    --bg:#262624; --panel:#1F1E1C; --card:#30302E; --borde:#3B3A36;
-    --tinta:#F5F4EF; --gris:#A8A69D; --acento:#4FB3E8;
-  }
 }
 *{box-sizing:border-box; margin:0; padding:0}
 html,body{height:100%}
@@ -1988,65 +2451,197 @@ body{
   display:flex; background:var(--bg); color:var(--tinta); overflow:hidden;
   font:15px/1.4 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
 }
+/* ---------- LA TIRA DE ÁREAS (23-ago-2026) ----------
+   Cinco caras, siempre a la vista, a la izquierda de todo. Es la que hace posible el
+   «ah, esto es de publicidad — pin, y hablo con Jaime».
+
+   POR QUÉ LA CARA Y NO UN COLOR SOLO: una cara se reconoce sin leer y sin tener que
+   acordarse de qué significaba el verde. El color la refuerza; nunca va solo. Eso es
+   además lo que hace que esto siga andando con sol de frente o para alguien que no
+   distingue rojo de verde.
+
+   POR QUÉ SÓLO EL BORDE (pedido del usuario): pintar el fondo de cada renglón de color
+   convierte la barra en un semáforo y tapa lo único que importa, que es el título. */
+#tira{
+  width:56px; flex:none; background:var(--panel); border-right:1px solid var(--borde);
+  display:flex; flex-direction:column; align-items:center;
+  padding:12px 0 8px;
+}
+/* Las caras arriba, y el pie de la tira (Cacho trabajando) abajo del todo. Van en dos
+   cajas porque `pintarTira()` reescribe el innerHTML de las caras cada vez que cambia
+   la cuenta: si el dibujo fuera hermano de los botones, se borraría en cada repintado. */
+#tira-caras{
+  flex:1; min-height:0; width:100%;
+  display:flex; flex-direction:column; align-items:center; gap:9px;
+  overflow-y:auto; overscroll-behavior:contain;
+}
+#tira .ar{
+  border:0; background:none; padding:2px; border-radius:50%; cursor:pointer;
+  line-height:0; position:relative; opacity:.62; transition:opacity .12s;
+}
+#tira .ar:hover{opacity:.9}
+#tira .ar.on{opacity:1}
+#tira .ar img{width:36px; height:36px; border-radius:50%; display:block}
+/* El aro de color sólo en la elegida: cinco aros prendidos a la vez es ruido y deja de
+   señalar cuál está activa, que es todo lo que tiene que decir. */
+#tira .ar.on{box-shadow:0 0 0 2.5px var(--ar-col)}
+/* Cuántas sesiones hay en esa área. Es lo que evita el cajón: se ve que Xara tiene 3
+   cosas esperando aunque estés metido en Jaime. */
+#tira .ar b{
+  position:absolute; right:-2px; bottom:-1px; min-width:15px; height:15px;
+  border-radius:8px; background:var(--ar-col); color:#fff; font-size:9px;
+  font-weight:700; line-height:15px; text-align:center; padding:0 3px;
+  border:1.5px solid var(--panel);
+}
+#tira .ar.vacia b{display:none}
+@media (max-width:700px){ #tira{display:none} }
+
+/* El marco del área alrededor de la pantalla donde TIPEÁS, no sólo en la lista. Es la
+   lección vieja de sistemas («producción es rojo»): el color sirve para no hacer en un
+   contexto lo que ibas a hacer en otro, y para eso tiene que estar donde mirás. el usuario pidió
+   sólo el borde, así que es un marco de 2 px y no un fondo. */
+#terms.con-area{box-shadow:inset 0 0 0 2px var(--ar-col); border-radius:12px}
+
 /* ---------- barra lateral ---------- */
 #side{
-  /* la barra va SIEMPRE oscura, aunque el dispositivo esté en modo claro —
-     el resto de la app sigue el tema del sistema */
-  --panel:#1F1E1C; --card:#30302E; --borde:#3B3A36;
-  --tinta:#F5F4EF; --gris:#A8A69D; --acento:#4FB3E8;
+  /* la barra iba SIEMPRE oscura (pedido del usuario 14-ago-2026) redefiniéndose la
+     paleta acá adentro. Desde el 23-ago-2026 la app es clara entera, así que
+     usa los colores de :root y no se pisa nada: un solo juego de colores en
+     todo Cacho. (De aquella época queda la lección: si algún día se vuelve a
+     redefinir --tinta en un bloque, hay que declarar TAMBIÉN `color`, porque
+     el color se hereda ya resuelto desde <body> y los títulos se vuelven
+     invisibles.) */
   width:300px; flex:none; background:var(--panel); border-right:1px solid var(--borde);
   display:flex; flex-direction:column; padding:14px 10px 10px;
+  color:var(--tinta);
 }
 #side h1{
   font-family:var(--display); font-weight:500; font-size:19px;
   display:flex; align-items:center; gap:8px; padding:2px 8px 12px;
 }
 #side h1 .logo{color:var(--acento); font-size:17px}
+/* Con un área elegida, el nombre de arriba es el botón para salir. Sin esto, en el celular
+   —donde la tira no entra— quedabas filtrado y sin forma de volver a ver todo. */
+#tit-area.en-area{cursor:pointer; color:var(--ar-col, var(--acento))}
+#tit-area.en-area::after{content:" ✕"; font-size:12px; opacity:.55}
 .logo-foto{width:32px; height:32px; border-radius:50%; flex:none}
+/* El «＋ Nueva sesión» salió el 27-ago-2026 (pedido del usuario): ocupaba el lugar más caro de
+   la barra —arriba de todo— y él nunca lo usaba, porque el trabajo es siempre sobre
+   Gestión. Crear sesión en cualquier otro proyecto sigue estando en la paleta (⌘K en la
+   compu, 🔍 en el teléfono): «nueva sesión en <proyecto>». */
+/* (29-ago-2026) El botón se mudó ADENTRO del <h1>, al lado del nombre. Dos motivos, y
+   el segundo es el que manda: ocupaba una FILA ENTERA de una barra donde lo caro es el
+   alto —cada fila que se va es una sesión más a la vista—, y sobre todo NO DECÍA LO QUE
+   HACE. Decía "📈 Gestión", que es el proyecto, y el proyecto es siempre el mismo. Ahora
+   abre una sesión CON QUIEN ESTÁS PARADO, así que su significado se lo da la cara de al
+   lado y no le hace falta texto propio: es un ＋ y nada más. Se tiñe del color del área
+   para que la cara, el nombre y el ＋ se lean como una sola cosa.
+   (La caja no cambia de tamaño con el nombre: `flex:none` y ancho fijo, así "Waldemar"
+   —el más largo— no le come el botón en los 300 px de la barra.) */
 #btn-nueva{
-  display:flex; align-items:center; gap:8px; width:100%;
-  background:var(--acento); color:#fff; border:0; border-radius:10px;
-  padding:9px 14px; font-size:12px; font-weight:600; cursor:pointer;
+  margin-left:auto; flex:none; width:26px; height:26px; border-radius:50%;
+  display:flex; align-items:center; justify-content:center;
+  background:var(--card); color:var(--ar-col, var(--acento));
+  border:1px solid var(--borde); font-size:14px; line-height:1; cursor:pointer;
+  font-family:inherit; padding:0;
 }
-#btn-nueva:hover{filter:brightness(.95)}
-#menu-proy{
-  display:none; background:var(--card); border:1px solid var(--borde);
-  border-radius:10px; margin-top:6px; overflow:hidden; box-shadow:0 6px 24px rgba(0,0,0,.12);
+#btn-nueva:hover{
+  background:var(--ar-col, var(--acento)); color:#fff; border-color:transparent;
 }
-#menu-proy.ver{display:block}
-#menu-proy button{
-  display:block; width:100%; text-align:left; background:none; border:0;
-  padding:8px 14px; font-size:12.5px; color:var(--tinta); cursor:pointer;
+/* Buscador de la barra (21-ago-2026). El ⌘K sigue estando —abre cualquier cosa
+   desde el teclado, incluso una sesión nueva—, pero se acuerda quien lo sabe.
+   Este está a la vista y hace otra cosa: filtra la lista SIN taparla, así que
+   las secciones y el estado de cada charla se siguen viendo mientras se busca.
+   Vive FUERA de #listas a propósito: la lista se repinta cada 4 s y si el input
+   estuviera adentro se perdería el foco y lo tipeado a mitad de palabra. */
+#filtro-caja{
+  display:flex; align-items:center; gap:6px; margin-top:12px;
+  background:var(--card); border:1px solid var(--borde); border-radius:10px;
+  padding:6px 9px;
 }
-#menu-proy button:hover{background:var(--panel)}
+#filtro-caja .lupa{font-size:11px; opacity:.6; flex:none}
+#filtro{
+  flex:1; min-width:0; background:none; border:0; outline:none;
+  color:var(--tinta); font-size:12.5px; font-family:inherit;
+}
+#filtro::placeholder{color:var(--gris)}
+#filtro-caja:focus-within{border-color:var(--acento)}
+#filtro-x{
+  border:0; background:none; color:var(--gris); cursor:pointer; font-size:11px;
+  padding:0 2px; display:none; flex:none;
+}
+body.buscando #filtro-x{display:block}
+#filtro-x:hover{color:var(--tinta)}
 #listas{flex:1; overflow-y:auto; margin-top:14px}
+/* ── Lo terminado va PLEGADO (26-ago-2026, pedido del usuario) ──────────────────
+   Listadas igual que las vivas, las de hoy que ya terminaron hacían que la barra
+   pareciera una lista de pendientes que nunca baja: "miro todo lo que tengo
+   pendiente y parece que no termino nunca". Se pliegan, no se esconden — están a
+   un click "por las dudas y preciso revisar algo". Se abren solas cuando estás
+   buscando (a una vieja se llega buscándola) o cuando la sesión abierta es una de
+   ellas: plegarla sería esconder justo dónde estás parado. */
+details.plegable > summary{
+  list-style:none; cursor:pointer; display:flex; align-items:center; gap:6px;
+  user-select:none;
+}
+details.plegable > summary::-webkit-details-marker{display:none}
+details.plegable > summary:hover{color:var(--tinta)}
+details.plegable .flecha{font-size:8px; width:8px; flex:none}
+details.plegable .cuantas{
+  margin-left:auto; background:var(--borde); color:var(--gris); border-radius:8px;
+  padding:0 6px; font-size:9.5px; line-height:15px; font-weight:700;
+}
+details.plegable .mas{color:var(--gris); font-size:10.5px; padding:4px 8px 8px}
+/* (27-ago-2026) el perro se mudó al pie de la TIRA, así que ya no le come lugar a la
+   lista y no hay razón para esconderlo mientras se busca. */
+.nada-con-eso{color:var(--gris); font-size:11.5px; padding:14px 8px; line-height:1.5}
 .seccion{
   color:var(--gris); font-size:10px; font-weight:700; letter-spacing:.08em;
   text-transform:uppercase; padding:10px 8px 6px;
 }
 .item{
   border-radius:10px; padding:8px 10px; cursor:pointer; margin-bottom:2px;
+  position:relative;
 }
 .item:hover{background:var(--card)}
-.item.activo{background:var(--card); box-shadow:inset 2px 0 0 var(--acento)}
-.item .fila{display:flex; align-items:center; gap:8px}
+/* La barrita de color del área, a la izquierda del renglón. 3 px: se ve de reojo y no
+   le roba lugar al título. */
+.item{border-left:3px solid transparent}
+/* La fijada conserva el color de SU área en la barrita (antes se le ponía ocre, que además
+   es el color de Xara: el mismo color diciendo dos cosas). Que está fijada ya lo dicen el
+   fondo, la negrita y el 📌 — no hace falta gastarle el único canal que tiene el área. */
+.item .cara-ar{width:15px; height:15px; border-radius:50%; flex:none; opacity:.9}
+/* Con un área elegida, la cara de cada renglón sobra: son todas la misma. */
+body.area-fija .item .cara-ar{display:none}
+.item .fila{display:flex; align-items:center; gap:8px; margin-top:4px}
 .dot{width:8px; height:8px; border-radius:50%; flex:none}
 .dot.trabajando{background:var(--acento); animation:lat 1.4s ease-in-out infinite}
 .dot.esperando{background:var(--ocre)}
 .dot.terminada{background:var(--gris); opacity:.5}
-@keyframes lat{0%,100%{box-shadow:0 0 0 0 rgba(45,156,219,.5)}50%{box-shadow:0 0 0 5px rgba(45,156,219,0)}}
+@keyframes lat{0%,100%{box-shadow:0 0 0 0 rgba(var(--acento-rgb),.5)}50%{box-shadow:0 0 0 5px rgba(var(--acento-rgb),0)}}
+/* El título va solo en su renglón y ENTERO (25-ago-2026, pedido del usuario): antes
+   compartía la fila con hora+iconitos y quedaba «Brief Reu…». Si es largo, envuelve. */
 .item .tit{
-  flex:1; font-size:12.5px; font-weight:500; white-space:nowrap;
-  overflow:hidden; text-overflow:ellipsis;
+  font-size:12.5px; font-weight:500; line-height:1.3;
+  white-space:normal; overflow-wrap:anywhere;
 }
-.item .sub{
-  color:var(--gris); font-size:10.5px; margin-top:2px; padding-left:16px;
-  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
-}
-.item .snippet{
-  color:var(--gris); font-size:10.5px; margin-top:2px; padding-left:16px;
-  white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-style:italic;
-}
+/* De qué va la charla: el ícono del tema al lado del título, "→ tema" cuando
+   se fue para otro lado, y abajo qué se está haciendo ahora. */
+.item .tema-ico{font-size:11.5px; opacity:.9}
+/* Peso de la charla (24-ago-2026). Se midió que el 99% del gasto son las charlas largas:
+   en cada turno se relee todo lo anterior, así que el costo crece al cuadrado. Esto lo
+   hace VISIBLE donde el usuario ya mira, en vez de pedirle que se acuerde de cortar. */
+.item .peso{font-size:10px; cursor:help; margin-left:2px}
+.item .peso-aviso{margin:4px 0 1px 0; padding:5px 7px; border-radius:6px; font-size:10.5px;
+  line-height:1.35; background:rgba(220,80,60,.12); color:#e9a08f;
+  display:flex; gap:6px; align-items:center; justify-content:space-between}
+.item .peso-aviso.amarillo{background:rgba(220,170,60,.10); color:#d8bd83}
+.item .peso-aviso button{flex:0 0 auto; font-size:10px; padding:3px 8px; border-radius:5px;
+  border:1px solid currentColor; background:transparent; color:inherit; cursor:pointer}
+.item .peso-aviso button:hover{background:rgba(255,255,255,.08)}
+.item .muto{color:var(--ocre); font-weight:600; font-size:11px}
+/* Las líneas chicas de contexto (.ctx) y pedido (.snippet) se sacaron el 25-ago-2026:
+   el usuario no las llegaba a leer y no sumaban. Esa info vive en el tooltip del renglón. */
 .item .x{
   border:0; background:none; color:var(--gris); opacity:.5; cursor:pointer;
   font-size:12px; padding:0 3px; border-radius:4px; flex:none;
@@ -2061,7 +2656,7 @@ body{
 .item:hover .acc{opacity:.75}
 .item .acc:hover{opacity:1}
 .item .acc.fijar.on{opacity:1}
-.item.fijada{background:var(--card); box-shadow:inset 2px 0 0 #d9a441}
+.item.fijada{background:var(--card)}
 .item.fijada .tit{font-weight:600}
 .item.fijada[draggable="true"]{cursor:grab}
 .item.arrastrando{opacity:.45; cursor:grabbing}
@@ -2072,20 +2667,55 @@ body{
 .item.avisada{background:rgba(184,134,11,.13)}
 .item.avisada .tit{font-weight:700}
 .item .campanita{color:var(--ocre); font-size:11px; flex:none}
+/* DÓNDE ESTÁS PARADO (21-ago-2026). Iba una línea fina del color del acento y
+   el mismo fondo que el hover y que las fijadas: con la lista llena no se sabía
+   cuál estaba abierta, y eso importa justo cuando se va a cerrar una. Va último
+   a propósito: gana sobre fijada y avisada, que también pintan el fondo. La
+   barra de la izquierda late — despacio y sin mover nada de lugar, para que se
+   encuentre de un vistazo sin que moleste mientras se lee. */
+.item.activo, .item.activo:hover{
+  background:rgba(var(--aca-rgb),.13);
+  box-shadow:inset 0 0 0 1px rgba(var(--aca-rgb),.38);
+}
+.item.activo::before{
+  content:""; position:absolute; left:0; top:5px; bottom:5px; width:3px;
+  border-radius:0 3px 3px 0; background:var(--aca);
+  animation:aca 2.2s ease-in-out infinite;
+}
+@keyframes aca{
+  0%,100%{opacity:1; box-shadow:0 0 7px rgba(var(--aca-rgb),.55)}
+  50%    {opacity:.35; box-shadow:0 0 0 rgba(var(--aca-rgb),0)}
+}
+/* Y con todas las letras, que es lo que se pidió: un cartelito que dice dónde estás
+   parado. El color solo lo sabe quien ya aprendió qué significa el color. */
+.item.activo .aca-estas{
+  background:var(--aca); color:#fff; border-radius:6px; padding:1px 5px; flex:none;
+  font-size:8.5px; font-weight:700; letter-spacing:.03em; text-transform:uppercase;
+}
+/* Hace cuánto. `nowrap` a propósito: con el cartel de "acá estás" en la misma fila,
+   "2 min" se partía en dos renglones y el renglón activo crecía de alto. */
+.item .fila .hs{color:var(--gris); font-size:10px; white-space:nowrap; flex:none}
+/* OJO: acá iba `color:#fff` (blanco), que servía cuando la barra era oscura y
+   sobre la crema desaparece. Sobre fondo claro el "estás acá" lo dan el tinte
+   coral y la negrita, no un color de letra propio (23-ago-2026). */
+.item.activo .tit{font-weight:700; color:var(--aca)}
+@media (prefers-reduced-motion:reduce){ .item.activo::before{animation:none} }
 /* ---------- Cacho ----------
-   Mientras alguna sesión de la app está trabajando, Cacho se sienta abajo de
-   la lista. Es el dibujo de él, y está SENTADO: respira, nada más. Nada de
-   recortarle la cabeza o las patas para animarlas por separado — la imagen se
-   escala entera y no se deforma nunca. Cuando no hay trabajo, desaparece. */
+   Mientras alguna sesión de la app está trabajando, Cacho se sienta al PIE DE LA TIRA,
+   abajo del todo de la columna de las caras (27-ago-2026, pedido del usuario: donde estaba
+   —abajo de la lista de sesiones— se comía el alto que hace falta para ver sesiones).
+   Es el dibujo de él, y está SENTADO: respira, nada más. Nada de recortarle la cabeza o
+   las patas para animarlas por separado — la imagen se escala entera y no se deforma
+   nunca. Cuando no hay trabajo, desaparece y la tira no cambia de alto. */
 #corriendo{
-  display:none; position:relative; height:46px; margin:8px 2px 0;
-  border-top:1px solid var(--borde);
+  display:none; position:relative; flex:none; height:44px; width:100%;
+  margin-top:6px; padding-top:6px; border-top:1px solid var(--borde);
   align-items:flex-end; justify-content:center;
-  contain:layout style;   /* el respirar no toca el layout de la lista */
+  contain:layout style;   /* el respirar no toca el layout de la tira */
 }
 #corriendo.ver{display:flex}
 #corriendo img{
-  height:42px; display:block; transform-origin:bottom center;
+  height:38px; display:block; transform-origin:bottom center;
   animation:respira 3.4s ease-in-out infinite;
 }
 @keyframes respira{
@@ -2093,6 +2723,26 @@ body{
   50%    {transform:scale(1.035)}
 }
 #pie{color:var(--gris); font-size:10.5px; padding:10px 8px 2px}
+/* ── Uso del plan (25-ago-2026) ──────────────────────────────────────────────
+   El % consumido del límite semanal, en el lenguaje de la casa (tubo + marca):
+   el relleno es lo USADO y la rayita es dónde DEBERÍAS ir a esta altura de la
+   semana. Relleno más allá de la rayita = gastando de más. El color lo dice
+   solo: verde a ritmo, ocre pasado, rojo camino a quedarte sin cupo antes del
+   lunes. El detalle (ritmo, cuándo se acaba, cuándo resetea) vive en el title. */
+#uso{padding:8px 8px 0; display:flex; flex-direction:column; gap:5px}
+#uso .u-lin{display:flex; align-items:center; gap:7px; font-size:10px;
+  color:var(--gris); cursor:help}
+#uso .u-eti{flex:none; width:46px; text-transform:uppercase; letter-spacing:.05em;
+  font-weight:700; font-size:9px}
+#uso .u-tubo{display:block; flex:1; height:7px; border-radius:4px; background:var(--card);
+  border:1px solid var(--borde); position:relative}
+#uso .u-fill{display:block; height:100%; border-radius:4px; background:#5a8a5e; max-width:100%}
+#uso .u-fill.ocre{background:var(--ocre)}
+#uso .u-fill.rojo{background:#c0453a}
+#uso .u-marca{position:absolute; top:-2px; bottom:-2px; width:2px;
+  background:var(--tinta); opacity:.55; border-radius:1px}
+#uso .u-pct{flex:none; width:34px; text-align:right; font-variant-numeric:tabular-nums}
+#uso .u-pct.rojo{color:#c0453a; font-weight:700}
 #btn-avisos{
   display:none; width:100%; margin-top:6px; background:none; cursor:pointer;
   border:1px dashed var(--borde); border-radius:10px; padding:7px 10px;
@@ -2107,11 +2757,10 @@ body{
 }
 #paleta.ver{display:flex}
 #paleta .caja{
-  --panel:#1F1E1C; --card:#30302E; --borde:#3B3A36;
-  --tinta:#F5F4EF; --gris:#A8A69D; --acento:#4FB3E8;
+  /* misma paleta que el resto (23-ago-2026): antes se forzaba oscura acá */
   width:min(560px, 92vw); max-height:66vh; display:flex; flex-direction:column;
-  background:var(--panel); color:var(--tinta); border:1px solid var(--borde);
-  border-radius:14px; overflow:hidden; box-shadow:0 24px 60px rgba(0,0,0,.5);
+  background:var(--card); color:var(--tinta); border:1px solid var(--borde);
+  border-radius:14px; overflow:hidden; box-shadow:0 24px 60px rgba(0,0,0,.28);
 }
 #paleta input{
   border:0; border-bottom:1px solid var(--borde); background:none; outline:none;
@@ -2123,7 +2772,7 @@ body{
   display:flex; align-items:center; gap:9px; padding:8px 10px;
   border-radius:9px; cursor:pointer; font-size:13px;
 }
-#paleta .op.sel{background:var(--card)}
+#paleta .op.sel{background:rgba(var(--acento-rgb),.14)}
 #paleta .op .qué{flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 #paleta .op .dónde{color:var(--gris); font-size:10.5px; flex:none}
 #paleta .vacio{color:var(--gris); font-size:12.5px; padding:14px 12px}
@@ -2267,8 +2916,7 @@ body{
   }
   .item{padding:11px 10px}
   .item .tit{font-size:14px}
-  .item .sub, .item .snippet{font-size:11.5px}
-  #btn-nueva{padding:12px 14px; font-size:14px}
+  #btn-nueva{width:32px; height:32px; font-size:17px}   /* el dedo, no el mouse */
   #terms{padding:8px}
   .term-box{inset:8px; border-radius:10px; padding:8px 10px}
   #vacio{font-size:15px; padding:0 24px; text-align:center}
@@ -2343,19 +2991,30 @@ body{
 <body>
 <div id="barra-m">
   <button id="btn-menu" title="Sesiones">☰</button>
-  <img class="logo-foto" src="/static/cacho.png" alt="">
+  <img class="logo-foto" id="cara-m" src="/static/cacho.png" alt="">
   <span class="tit-m" id="tit-m">Cacho</span>
   <button id="btn-buscar" title="Buscar sesión">🔍</button>
 </div>
 <div id="velo"></div>
 <div id="aviso-m"></div>
-<div id="side">
-  <h1><img class="logo-foto" src="/static/cacho.png" alt=""> Cacho</h1>
-  <button id="btn-nueva">＋ Nueva sesión</button>
-  <div id="menu-proy"></div>
-  <div id="listas"></div>
+<div id="tira">
+  <div id="tira-caras"></div>
   <div id="corriendo"><img src="/static/cacho-dibujo.png" alt="Cacho"></div>
+</div>
+<div id="side">
+  <h1><img class="logo-foto" id="cara-area" src="/static/cacho.png" alt="">
+      <span id="tit-area" title="">Cacho</span>
+      <button id="btn-nueva" title="Nueva sesión con Cacho"
+              aria-label="Nueva sesión con Cacho">＋</button></h1>
+  <div id="filtro-caja">
+    <span class="lupa">🔍</span>
+    <input id="filtro" placeholder="Buscar en las sesiones…" autocomplete="off"
+           autocorrect="off" spellcheck="false">
+    <button id="filtro-x" title="Limpiar (esc)">✕</button>
+  </div>
+  <div id="listas"></div>
   <button id="btn-avisos">🔔 Avisarme cuando una sesión termine</button>
+  <div id="uso"></div>
   <div id="pie">cargando…</div>
 </div>
 <div id="paleta">
@@ -2399,11 +3058,43 @@ body{
 <script>
 const $ = s => document.querySelector(s);
 // teléfono: la barra lateral pasa a ser un cajón (ver CSS @media ≤700px)
-const MOVIL = matchMedia("(max-width:700px)").matches;
+const MQ_MOVIL = matchMedia("(max-width:700px)");
+const MOVIL = MQ_MOVIL.matches;
+/* RAÍZ (23-ago-2026): esto se congelaba al cargar la página y el CSS seguía
+   midiendo en vivo. Si la ventana cargaba angosta (≤700px) y DESPUÉS se
+   agrandaba, los dos quedaban en desacuerdo para siempre:
+     · el JS creía "teléfono" → nunca prendía el 🎤 ni el ➤ del escritorio
+       (micVisible() arranca con !MOVIL);
+     · el CSS medía la ventana real y creía "escritorio" → dejaba escondida
+       la barra de abajo del teléfono, que tiene su propio 🎤 y su ➤.
+   Resultado: los dos botones desaparecidos, sin un solo error en la consola.
+   Se ve en el pie de la lista: si dice "…terminadas hoy" SIN "· ⌘K buscar",
+   el JS se cree teléfono. Como la página es un visor sin estado (las sesiones
+   viven en el server, no acá), cruzar el umbral se arregla recargando: así
+   JS y CSS no pueden discrepar nunca más. */
+MQ_MOVIL.addEventListener("change", () => location.reload());
 function menu(abrir){ document.body.classList.toggle("menu-abierto", abrir); }
-let estado = {tabs:[], afuera:[], proyectos:[]};
+let estado = {tabs:[], afuera:[], proyectos:[], casa:""};
 let abiertas = {};        // id -> {term, fit, es, box}
 let activa = null;
+// Si el cajón de "Terminadas hoy" quedó abierto. Vive acá y no en el DOM porque
+// render() reescribe #listas entero cada 4 s: sin esto, el cajón se cerraría solo
+// a los cuatro segundos de abrirlo. Se recuerda entre recargas.
+let terminadasAbiertas = false;
+// try/catch: es el único localStorage de toda la app y esto corre en el tope del
+// script — si el navegador lo tiene bloqueado, un throw acá deja a Cacho sin JS.
+try{ terminadasAbiertas = localStorage.getItem("cacho_terminadas") === "1"; }catch(_){}
+let filtroTxt = "";       // lo escrito en el buscador de la barra
+/* ─── ÁREAS (23-ago-2026) ───────────────────────────────────────────────────────────
+   `areaActiva` null = ver TODO, que es como arranca siempre. Eso no es un detalle: la
+   investigación decía que un cajón que esconde cosas se abandona, así que el estado por
+   defecto muestra el panorama entero y el foco es algo que se pide, no algo que se sufre.
+   Tampoco se recuerda entre recargas a propósito: si Cacho abriera filtrado en Jaime,
+   el día que algo urgente esté en Xara no lo ves y no sabés por qué. */
+let areaActiva = null;
+const areaDe = o => (o && o.area) || estado.area_defecto || (estado.areas||[{}])[0].clave;
+const areaInfo = k => (estado.areas || []).find(a => a.clave === k) || null;
+const areaColor = k => (areaInfo(k) || {}).color || "var(--gris)";
 
 // Sesiones que terminaron y todavía no miraste (ver "avisos" más abajo). Se
 // declaran acá arriba porque itemHTML() las lee para marcar el ítem.
@@ -2497,8 +3188,11 @@ function abrirTab(id){
     // visor de la sesión, acá alcanza con poder subir un rato (19-ago-2026).
     cursorBlink:true, scrollback:3000, allowProposedApi:true,
     theme:{
-      background:"#1E1D1B", foreground:"#E8E6DC", cursor:"#2D9CDB",
-      cursorAccent:"#1E1D1B", selectionBackground:"rgba(45,156,219,.35)"
+      // la terminal queda OSCURA a propósito (ver la nota de la paleta arriba):
+      // los colores ANSI de Claude Code están pensados para fondo oscuro. El
+      // cursor y la selección sí van en el coral de la casa (23-ago-2026).
+      background:"#1E1D1B", foreground:"#E8E6DC", cursor:"#D97757",
+      cursorAccent:"#1E1D1B", selectionBackground:"rgba(217,119,87,.38)"
     }
   });
   const fit = new FitAddon.FitAddon();
@@ -2622,18 +3316,44 @@ function cerrarTab(id, matar){
   refrescar();
 }
 
-async function nueva(cwd){
-  $("#menu-proy").classList.remove("ver");
+/* Un disparo a la vez (21-ago-2026). Aparecieron TRES "Nueva sesión" vacías seguidas
+   —cuatro pestañas entre las 10:44:20 y las 10:44:28, dos de ellas en el MISMO segundo—
+   y parecía que Cacho las creaba solo. No: el arranque automático de más abajo sólo crea
+   cuando no hay ninguna pestaña viva, y en ese momento había cuatro trabajando. O sea que
+   sí o sí salieron de un click, repetido: `nueva()` tarda ~1 s en contestar y hasta
+   entonces el botón seguía aceptando clicks, cada uno con su zsh + su claude + su pty.
+   Con la mini al 100% de RAM eso no es cosmético.
+   Dos disparos que no son "hacer click de nuevo a propósito" y que esto también tapa:
+   el doble click, y el botón que quedó CON FOCO y se vuelve a activar con Enter o
+   barra espaciadora (por eso además se le saca el foco al usarlo, más abajo). */
+let creandoSesion = false;
+let ultimaSesionCreada = 0;
+const ESPERA_NUEVA = 1500;   // ms entre creaciones desde la interfaz
+
+// `area`: con quién se abre la charla. Vacío = que la clasifique la máquina, como
+// siempre. Va en la URL y no como cuerpo porque el server ya lee todo de la query.
+async function nueva(cwd, area){
+  if(creandoSesion || Date.now() - ultimaSesionCreada < ESPERA_NUEVA){
+    // decirlo, no ignorar en silencio: si de verdad querías dos, en un segundo podés
+    aviso("Esperá, ya estoy creando una sesión…");
+    return;
+  }
+  creandoSesion = true;
   // feedback visible: antes fallaba MUDA (si el fetch se colgaba o el server
   // devolvía error, en el teléfono parecía que el botón no hacía nada)
   aviso("Creando sesión…");
   try{
-    const r = await fetch("/api/term/new?cwd=" + encodeURIComponent(cwd), {method:"POST"});
+    const r = await fetch("/api/term/new?cwd=" + encodeURIComponent(cwd)
+                          + (area ? "&area=" + encodeURIComponent(area) : ""),
+                          {method:"POST"});
     const j = await r.json();
     if(!j.id) throw new Error(j.error || ("HTTP " + r.status));
     await refrescar(); abrirTab(j.id); aviso("");
   }catch(err){
     aviso("No pude crear la sesión: " + err.message, true);
+  }finally{
+    creandoSesion = false;
+    ultimaSesionCreada = Date.now();
   }
 }
 
@@ -2728,9 +3448,11 @@ async function pintarVer(){
 }
 
 /* ---------------- render ---------------- */
-// Un ítem de la barra. `o` es la sesión (pestaña o de afuera) y `attrs` los data-* que
-// definen qué pasa al hacerle click (abrir pestaña / enfocar Terminal / ver read-only).
-// Botones: 📌 fijar arriba · ✏️ ponerle nombre propio · ✕ cerrar (solo pestañas).
+// El renglón de una charla, en DOS alturas (25-ago-2026, pedido del usuario):
+//   1) el título ENTERO, con su ícono de tema — sin cortar: si es largo, envuelve
+//   2) abajo los iconitos: cara del área, estado, hora, peso, campanita, acciones
+// Las líneas chicas de contexto/pedido se sacaron ("no me suman nada, no las
+// llego a leer"): esa info sigue viva en el tooltip del renglón y en el buscador.
 function itemHTML(o, attrs, opts){
   opts = opts || {};
   const sid = o.sid || "";
@@ -2738,19 +3460,61 @@ function itemHTML(o, attrs, opts){
       <button class="acc fijar ${o.fija?"on":""}" data-fijar="${esc(sid)}"
         title="${o.fija?"Soltar de arriba":"Fijar arriba"}">${o.fija?"📌":"📍"}</button>
       <button class="acc" data-renombrar="${esc(sid)}" data-nombre="${esc(o.titulo)}"
-        title="Ponerle un nombre">✏️</button>` : "";
+        title="Ponerle un nombre">✏️</button>
+      <button class="acc" data-area-de="${esc(sid)}" data-area-hoy="${esc(areaDe(o))}"
+        title="Cambiarla de área">🏷️</button>` : "";
   const espera = esperan.has(claveDe(o));
+  // el título no se toca nunca si tiene nombre propio; el ícono es de al lado
+  const mutó = o.tema && o.tema_ini && o.tema !== o.tema_ini;
+  // Lo que antes iba en letras chicas abajo (contexto, pedido, proyecto) vive acá:
+  // se lee posando el mouse, y el buscador lo sigue encontrando (textoDe).
+  const tip = [o.titulo, o.tema ? "tema: "+o.tema+(mutó?" (arrancó en "+o.tema_ini+")":"") : "",
+               o.contexto, o.pedido ? "⟶ " + o.pedido : "", o.proyecto]
+              .filter(Boolean).join("\n");
+  const ar = areaDe(o), arI = areaInfo(ar);
+  // La cara del área en el renglón: es lo que te dice de quién es cada cosa AUNQUE estés
+  // viendo todo. Sin esto, el panorama vuelve a ser una lista plana.
+  const caraAr = arI
+    ? `<img class="cara-ar" src="/static/${esc(arI.cara)}" alt=""
+            title="${esc(arI.nombre)} · ${esc(arI.rol)}${o.area_propia?" (se lo pusiste vos)":""}">`
+    : "";
   return `
       <div class="item ${opts.activo?"activo":""} ${opts.fijada?"fijada":""} ${espera?"avisada":""}" ${attrs}
-           data-sid="${esc(sid)}" ${opts.fijada?'draggable="true"':""}>
-        <div class="fila"><span class="dot ${o.estado}"></span>
-          <span class="tit ${o.renombrada?"propio":""}">${esc(o.titulo)}</span>
+           data-sid="${esc(sid)}" data-ar="${esc(ar)}"
+           ${opts.fijada?'draggable="true"':""} title="${esc(tip)}"
+           style="border-left-color:${esc(areaColor(ar))}">
+        <div class="tit ${o.renombrada?"propio":""}"
+          >${o.icono?'<span class="tema-ico">'+o.icono+'</span> ':""}${esc(o.titulo)}${
+            mutó?'<span class="muto"> → '+esc(o.tema)+'</span>':""}</div>
+        <div class="fila">${caraAr}<span class="dot ${o.estado}"
+            title="${o.estado==="trabajando"?"trabajando":o.estado==="esperando"?"quieta, te espera":"terminada"}"></span>
           ${espera?'<span class="campanita" title="terminó y te espera">🔔</span>':""}
-          <span style="color:var(--gris);font-size:10px">${hace(o.hace_seg)}</span>
-          ${acciones}${opts.botonX||""}</div>
-        <div class="sub">${esc(o.proyecto)}</div>
-        ${o.ultimo_txt&&!opts.sinSnippet?'<div class="snippet">'+esc(o.ultimo_quien)+": "+esc(o.ultimo_txt)+"</div>":""}
+          ${opts.activo?'<span class="aca-estas">acá estás</span>':""}
+          <span class="hs">${hace(o.hace_seg)}</span>
+          ${o.peso&&o.peso!=="verde"?'<span class="peso" title="'+esc(o.peso_nota)+'">'
+             +(o.peso==="rojo"?"🔴":"🟡")+'</span>':""}
+          <span style="flex:1"></span>${acciones}${opts.botonX||""}</div>
+        ${o.peso==="rojo"&&opts.activo?'<div class="peso-aviso"><span>'+esc(o.peso_nota)
+          +'</span><button onclick="event.stopPropagation();nueva('+JSON.stringify(o.cwd||"")
+          +')">Nueva</button></div>':""}
       </div>`;
+}
+
+/* Buscar: lo usan el campo de la barra y el ⌘K, para que los dos entiendan lo
+   mismo. Por PALABRAS y no por frase seguida: los títulos arrancan con emoji y
+   traen cosas en el medio, así el orden y lo que haya entremedio no importan.
+   Sin tildes: "meta ads" tiene que encontrar "Metá". */
+function buscador(q){
+  const norm = s => String(s || "").toLowerCase()
+    .normalize("NFD").replace(/[̀-ͯ]/g, "");
+  const palabras = norm(q).trim().split(/\s+/).filter(Boolean);
+  return txt => { const s = norm(txt); return palabras.every(w => s.includes(w)); };
+}
+// Todo lo que se puede escribir de una charla para encontrarla: cómo se llama,
+// de qué va, qué está tocando y qué le pediste.
+function textoDe(o){
+  return [o.titulo, o.tema, o.tema_ini, o.contexto, o.pedido, o.proyecto,
+          o.ultimo_txt].filter(Boolean).join(" ");
 }
 
 // Los data-* de cada tipo de sesión, para poder dibujarla igual en su sección o arriba.
@@ -2760,10 +3524,117 @@ function attrsDe(o){
   return `data-ver="${esc(o.id)}" data-vtit="${esc(o.titulo)}" data-viva="${o.viva?1:0}"`;
 }
 
+let tiraFirma = "";      // cómo estaba la tira la última vez que se dibujó
+function pintarTira(){
+  const t = $("#tira-caras");   // sólo las caras: el pie (Cacho trabajando) no se repinta
+  if(!t || !estado.areas) return;
+  // Cuántas sesiones vivas tiene cada área. Se cuenta sobre TODO lo vivo (pestañas de la
+  // app + lo de afuera), sin el buscador: el número tiene que decir cuánto hay, no cuánto
+  // hay de lo que estás buscando.
+  const vivas = estado.tabs.concat(estado.afuera.filter(s => s.viva));
+  const cuenta = {};
+  vivas.forEach(o => { const a = areaDe(o); cuenta[a] = (cuenta[a] || 0) + 1; });
+  // Sólo se redibuja si CAMBIÓ algo. `render()` corre cada 4 s y rearmar el innerHTML
+  // recreaba las cinco <img> cada vez: no se vuelven a bajar (están en caché) pero es
+  // trabajo de DOM al pedo en un bucle permanente, y en el celular se notaba el parpadeo.
+  const firma = estado.areas.map(a => a.clave + ":" + (cuenta[a.clave] || 0)).join("|")
+                + "|" + (areaActiva || "");
+  if(firma === tiraFirma) return;
+  tiraFirma = firma;
+  t.innerHTML = estado.areas.map(a => {
+    const n = cuenta[a.clave] || 0;
+    const on = areaActiva === a.clave;
+    return `<button class="ar ${on?"on":""} ${n?"":"vacia"}" data-area="${esc(a.clave)}"
+              style="--ar-col:${esc(a.color)}"
+              title="${esc(a.nombre)} · ${esc(a.rol)} — le habla a ${esc(a.gente)}${
+                n ? "\n" + n + (n===1?" sesión":" sesiones") : "\nsin sesiones vivas"}${
+                on ? "\n\n(tocá de nuevo para ver todo)" : ""}">
+              <img src="/static/${esc(a.cara)}" alt="${esc(a.nombre)}"><b>${n}</b></button>`;
+  }).join("");
+}
+
+/* El marco de área alrededor de la terminal abierta. Se recalcula al cambiar de pestaña y
+   al repintar: si la sesión cambia de área sola (porque cambió de tema), el marco la sigue. */
+function pintarMarcoArea(){
+  const t = $("#terms");
+  if(!t) return;
+  let k = null;
+  if(activa){
+    const o = estado.tabs.find(x => x.id === activa)
+           || (estado.afuera || []).find(x => ("ver:"+x.id) === activa);
+    if(o) k = areaDe(o);
+  }
+  // EL MARCO es de la terminal: dice en qué contexto estás TIPEANDO, así que lo manda la
+  // sesión abierta y sólo cae al filtro cuando no hay ninguna («producción es rojo»).
+  const kMarco = k || areaActiva;
+  t.classList.toggle("con-area", !!kMarco);
+  if(kMarco) t.style.setProperty("--ar-col", areaColor(kMarco));
+  document.body.classList.toggle("area-fija", !!areaActiva);
+  // EL NOMBRE DE ARRIBA es OTRA cosa: es CON QUIÉN ESTÁS HABLANDO, y eso lo decide el usuario
+  // tocando una cara en la tira. Por eso el filtro le gana a la sesión abierta y no al
+  // revés (27-ago-2026): elegir a Carla es una decisión explícita; el área de la sesión
+  // es una inferencia de la máquina, y una inferencia no puede pisar una decisión. Con la
+  // tira en Carla y esta misma terminal abierta (que es de Cacho), la barra decía "Cacho".
+  // Sin nada elegido sigue mandando la sesión abierta, que es lo que ya andaba bien.
+  // El ✕ para salir del filtro va SÓLO cuando hay filtro: sin él no hay nada que salir.
+  const tit = $("#tit-area");
+  const ai = areaInfo(areaActiva || k || "");
+  if(tit){
+    tit.textContent = ai ? ai.nombre : "Cacho";
+    tit.title = ai ? (ai.rol + " — le habla a " + ai.gente
+                      + (areaActiva ? " · tocá para ver todo" : "")) : "";
+    tit.classList.toggle("en-area", !!areaActiva);
+    if(ai) tit.style.setProperty("--ar-col", ai.color);
+  }
+  // El ＋ hace EXACTAMENTE lo que dice el nombre de al lado, y por eso lee la misma `ai`
+  // que el título en vez de `areaActiva` a secas. Con la tira sin filtro y una sesión de
+  // Jaime abierta, arriba dice "Jaime": si el ＋ abriera una sesión sin área, el botón
+  // estaría diciendo una cosa y haciendo otra — que es peor que no tenerlo. El área
+  // viaja en el dataset porque el click se atiende en otro scope, y así no hace falta
+  // una variable global más que mantener sincronizada.
+  // El color se setea en el <h1> (el padre) y no en el título: `--ar-col` se hereda hacia
+  // abajo, así que puesto acá lo agarran el nombre Y el botón; puesto en el <span> el
+  // botón —que es su hermano— se quedaba sin él y salía siempre del color de la casa.
+  const h1 = $("#side h1"), bn = $("#btn-nueva");
+  if(h1 && ai) h1.style.setProperty("--ar-col", ai.color);
+  if(bn){
+    const con = "Nueva sesión con " + (ai ? ai.nombre : "Cacho");
+    bn.dataset.nuevaEn = ai ? ai.clave : "";   // NO `data-area`: ése es de la tira
+    bn.title = con;
+    bn.setAttribute("aria-label", con);
+  }
+  // La cara va con el nombre, siempre. Estaba clavada en cacho.png y decía "Carla" con la
+  // cara de Cacho al lado: en un sistema donde LA CARA IDENTIFICA (ver areas.py), una cara
+  // que no corresponde no es un detalle estético, es el identificador mintiendo.
+  ponerCara("#cara-area", ai ? ai.cara : null);
+  // Arriba en el celular el título es el de la SESIÓN abierta, así que ahí la cara es la del
+  // área de esa sesión (`k`), no la del filtro elegido.
+  ponerCara("#cara-m", (areaInfo(k || areaActiva || "") || {}).cara || null);
+}
+
+/* Cambia una cara sólo si de verdad cambió: `render()` corre cada 4 s y reescribir el src
+   idéntico reinicia la animación de "respira" del logo cuando hay trabajo. */
+function ponerCara(sel, cara){
+  const img = $(sel);
+  if(!img) return;
+  const src = "/static/" + (cara || "cacho.png");
+  if(img.getAttribute("src") !== src) img.setAttribute("src", src);
+}
+
 function render(){
-  // barra lateral
-  const tabs = estado.tabs.map(t => Object.assign({__tab:true}, t));
-  const vivasAfuera = estado.afuera.filter(s => s.viva);
+  // barra lateral. Con el buscador escrito, TODAS las secciones quedan filtradas
+  // (las fijadas incluidas: si buscás algo, buscás en todo) y se muestran más
+  // terminadas de lo habitual — a una vieja se llega buscándola, no bajando.
+  const q = (filtroTxt || "").trim();
+  const casaCon = buscador(q);
+  // El área filtra ANTES que el buscador. Con un área elegida, buscar busca adentro de esa
+  // área — que es lo que espera cualquiera que acaba de decir «estoy en publicidad».
+  const filtrar = a => {
+    let r = areaActiva ? a.filter(o => areaDe(o) === areaActiva) : a;
+    return q ? r.filter(o => casaCon(textoDe(o))) : r;
+  };
+  const tabs = filtrar(estado.tabs.map(t => Object.assign({__tab:true}, t)));
+  const vivasAfuera = filtrar(estado.afuera.filter(s => s.viva));
   const term = vivasAfuera.filter(s => s.tipo === "terminal");
   const autos = vivasAfuera.filter(s => s.tipo !== "terminal");
   const muertas = estado.afuera.filter(s => !s.viva).length;
@@ -2773,12 +3644,10 @@ function render(){
   let h = "";
 
   // ── FIJADAS: salen de su sección y suben al tope, en el orden que las dejaste ──
-  const fijadas = tabs.concat(estado.afuera).filter(o => o.fija);
+  const fijadas = tabs.concat(filtrar(estado.afuera)).filter(o => o.fija);
   fijadas.sort((a,b) => (a.orden==null?9999:a.orden) - (b.orden==null?9999:b.orden));
   const fijos = new Set(fijadas.map(o => o.sid));
   if(fijadas.length){
-    // con snippet: las fijadas son justamente las que mirás de reojo para
-    // saber en qué anda cada una sin tener que abrirlas
     h += '<div class="seccion">📌 Fijadas</div>' + fijadas.map(o =>
       itemHTML(o, attrsDe(o), {activo:esActiva(o), fijada:true,
                                botonX: o.__tab ? botonX(o) : ""})).join("");
@@ -2800,23 +3669,46 @@ function render(){
     h += '<div class="seccion">Automáticas</div>' +
       autosL.map(s => itemHTML(s, attrsDe(s), {activo:esActiva(s)})).join("");
   }
-  const term12 = libres(estado.afuera.filter(s => !s.viva)).slice(0, 12);
+  const terminadas = libres(filtrar(estado.afuera.filter(s => !s.viva)));
+  const term12 = terminadas.slice(0, q ? 40 : 12);
   if(term12.length){
-    h += '<div class="seccion">Terminadas hoy</div>' +
-      term12.map(s => itemHTML(s, attrsDe(s), {activo:esActiva(s), sinSnippet:true})).join("");
+    // Plegadas salvo que estés buscando o que la sesión abierta sea una de ellas.
+    const abierto = !!q || terminadasAbiertas || term12.some(esActiva);
+    const sobran = terminadas.length - term12.length;
+    h += '<details class="plegable"' + (abierto ? " open" : "") + '>' +
+      '<summary class="seccion"><span class="flecha">' + (abierto ? "▼" : "▶") +
+        '</span> Terminadas hoy<span class="cuantas">' + terminadas.length +
+        '</span></summary>' +
+      term12.map(s => itemHTML(s, attrsDe(s), {activo:esActiva(s)})).join("") +
+      (sobran > 0 ? '<div class="mas">y ' + sobran + ' más — buscala por su nombre</div>' : "") +
+      '</details>';
+  }
+  if(!h && q){
+    h = '<div class="nada-con-eso">Nada con «' + esc(q) + '»' +
+        (areaActiva ? ' en ' + esc((areaInfo(areaActiva)||{}).nombre || "") : "") + '.<br>' +
+        'Se busca en el título, el tema, lo que se está tocando y lo que pediste.</div>';
+  }
+  if(!h && areaActiva && !q){
+    const ai = areaInfo(areaActiva) || {};
+    h = '<div class="nada-con-eso">Nada en ' + esc(ai.nombre || "") + ' ahora mismo.<br>' +
+        'Tocá su cara de nuevo para ver todo.</div>';
   }
   $("#listas").innerHTML = h || '<div class="seccion">Sin sesiones vivas</div>';
+  pintarTira();
+  pintarMarcoArea();
   // Cacho corre mientras haya trabajo adentro de la app (en el teléfono, donde
   // no se ve la barra, es el logo de arriba el que trota)
   const hayTrabajo = estado.tabs.some(t => t.estado === "trabajando");
   $("#corriendo").classList.toggle("ver", hayTrabajo);
   document.body.classList.toggle("hay-trabajo", hayTrabajo);
-  $("#pie").textContent = estado.tabs.length + " en la app · " +
-    vivasAfuera.length + " afuera · " + muertas + " terminadas hoy" +
-    (MOVIL ? "" : " · ⌘K buscar");
+  const cuantas = tabs.length + vivasAfuera.length + term12.length;
+  $("#pie").textContent = q
+    ? cuantas + (cuantas === 1 ? " charla" : " charlas") + " con «" + q + "» · esc para limpiar"
+    : estado.tabs.length + " en la app · " + vivasAfuera.length + " afuera · " +
+      muertas + " terminadas hoy" + (MOVIL ? "" : " · ⌘K buscar");
   if(MOVIL){
     const t = estado.tabs.find(t => t.id === activa);
-    $("#tit-m").textContent = t ? t.titulo :
+    $("#tit-m").textContent = t ? ((t.icono ? t.icono + " " : "") + t.titulo) :
       (activa && activa.startsWith("ver:") ? verTitulo : "Cacho");
   }
   micVisible();
@@ -2867,14 +3759,84 @@ document.addEventListener("dragend", async () => {
   pausaRefresco = false;
 });
 
+/* ---------------- buscador de la barra ---------------- */
+function buscar(txt){
+  filtroTxt = txt || "";
+  const caja = $("#filtro");
+  if(caja && caja.value !== filtroTxt) caja.value = filtroTxt;
+  document.body.classList.toggle("buscando", !!filtroTxt.trim());
+  render();
+}
+$("#filtro").addEventListener("input", e => buscar(e.target.value));
+$("#filtro").addEventListener("keydown", e => {
+  if(e.key === "Escape"){ buscar(""); e.target.blur(); }
+  // ⏎ abre la primera de la lista: buscar y entrar sin soltar el teclado
+  if(e.key === "Enter"){
+    const primera = $("#listas").querySelector(".item");
+    if(primera) primera.click();
+  }
+});
+
 /* ---------------- eventos ---------------- */
 document.addEventListener("click", e => {
+  if(e.target.closest("#filtro-x")){ buscar(""); $("#filtro").focus(); return; }
   if(e.target.closest("#btn-buscar")){ menu(false); abrirPaleta(); return; }
   if(e.target.closest("#btn-menu")){
     menu(!document.body.classList.contains("menu-abierto"));
     return;
   }
   if(e.target.id === "velo"){ menu(false); return; }
+  // El cajón de las terminadas: lo abrimos nosotros (preventDefault) para que el
+  // repintado de cada 4 s lo vuelva a dibujar como lo dejaste.
+  const pleg = e.target.closest("summary");
+  if(pleg){
+    e.preventDefault();
+    terminadasAbiertas = !terminadasAbiertas;
+    try{ localStorage.setItem("cacho_terminadas", terminadasAbiertas ? "1" : "0"); }catch(_){}
+    render();
+    return;
+  }
+  // Salir del área desde el nombre de arriba: es el único camino cuando la tira no está.
+  if(e.target.closest("#tit-area.en-area")){
+    e.stopPropagation();
+    areaActiva = null;
+    pintarTira(); render(); pintarMarcoArea();
+    return;
+  }
+  // ── La tira: entrar a un área, o volver a ver todo tocando la misma otra vez ──
+  // ACOTADO A LA TIRA (29-ago-2026). Decía `closest("[data-area]")` a secas, o sea que
+  // reclamaba el click de CUALQUIER elemento de la página con ese atributo. Se lo comió
+  // al ＋ de arriba el mismo día que nació —le habíamos puesto `data-area` para saber con
+  // quién abrir la sesión—: el botón, en vez de crear nada, apagaba el filtro. Y falla
+  // así de callado: el click "funciona", hace otra cosa. Un atributo no puede ser un
+  // contrato global de toda la app; el handler dice ahora DÓNDE vive lo que atiende.
+  const ar = e.target.closest("#tira-caras [data-area]");
+  if(ar){
+    e.stopPropagation();
+    const k = ar.dataset.area;
+    areaActiva = (areaActiva === k) ? null : k;
+    pintarTira(); render(); pintarMarcoArea();
+    // El buscador se limpia al cambiar de área: quedaba filtrando sobre la nueva y daba
+    // «nada con eso» en un área que sí tenía cosas.
+    if(filtroTxt) buscar("");
+    return;
+  }
+  // ── Corregir a qué área es una sesión (la máquina propone, el usuario decide) ──
+  const cam = e.target.closest("[data-area-de]");
+  if(cam){
+    e.stopPropagation();
+    const sid = cam.dataset.areaDe, hoy = cam.dataset.areaHoy;
+    const ops = (estado.areas || []);
+    const lista = ops.map((a,i) => (i+1) + ") " + a.nombre + " — " + a.rol +
+                                   (a.clave===hoy ? "  ← ahora" : "")).join("\n");
+    const r = prompt("¿De qué área es esta sesión?\n\n" + lista +
+                     "\n\n0) que la elija sola\n\nNúmero:", "");
+    if(r === null) return;
+    const n = parseInt(r.trim(), 10);
+    if(r.trim() === "0"){ guardarMeta(sid, {area: ""}); return; }
+    if(n >= 1 && n <= ops.length) guardarMeta(sid, {area: ops[n-1].clave});
+    return;
+  }
   const fij = e.target.closest("[data-fijar]");
   if(fij){
     e.stopPropagation();
@@ -2913,16 +3875,20 @@ document.addEventListener("click", e => {
     }
     if(item.dataset.ver){ abrirVer(item.dataset.ver, item.dataset.vtit, item.dataset.viva === "1"); return; }
   }
-  if(e.target.closest("#btn-nueva")){
-    const m = $("#menu-proy");
-    m.innerHTML = estado.proyectos.map(p =>
-      `<button data-cwd="${esc(p.cwd)}">${esc(p.nombre)}</button>`).join("");
-    m.classList.toggle("ver");
+  const bg = e.target.closest("#btn-nueva");
+  if(bg){
+    // Nueva sesión CON QUIEN ESTÁS PARADO. El proyecto sigue siendo el primero —
+    // siempre lo fue—; lo que se agrega es el área, que hasta hoy había que esperar
+    // que la máquina adivinara del texto. Sin nadie elegido en la tira sale igual que
+    // antes: sesión pelada que clasifica sola.
+    // blur() a propósito: es el único botón que crea una sesión de UN click, está
+    // pegado arriba del buscador, y si se queda con el foco cualquier Enter o barra
+    // espaciadora posterior lo vuelve a disparar sin que nadie lo haya tocado.
+    bg.blur();
+    const p = estado.proyectos[0];
+    if(p) nueva(p.cwd, bg.dataset.nuevaEn || "");
     return;
   }
-  const bp = e.target.closest("#menu-proy button");
-  if(bp){ nueva(bp.dataset.cwd); return; }
-  $("#menu-proy").classList.remove("ver");
 });
 
 window.addEventListener("resize", () => {
@@ -3250,26 +4216,57 @@ setInterval(chequearBoot, 15000);
 document.addEventListener("dragleave", e => {
   if(!e.relatedTarget) $("#terms").classList.remove("arrastrando");
 });
-// Después de soltar un archivo, el foco NO queda en la terminal: Chrome se lo
-// deja al documento y había que dar un click adentro para que el Enter cayera
-// en la sesión (queja de 16-ago-2026). Un solo focus() no alcanza — el
-// navegador termina de digerir el drop DESPUÉS de nuestro handler y lo pisa.
-// Por eso se insiste unas cuantas veces durante medio segundo.
+// Después de soltar un archivo hay DOS focos distintos, y confundirlos es por qué
+// esto seguía sin andar (queja del usuario, 23-ago-2026: "tengo que volver a clickear
+// adentro de la pantalla"):
+//   1) el foco de VENTANA, que lo maneja macOS. Arrastrás desde el Finder —que es
+//      la app del frente— y soltar NO le pasa el foco de teclado a la ventana que
+//      recibe el archivo: lo que escribías se lo llevaba el Finder. Ningún focus()
+//      de JavaScript puede arreglar eso, la página no se puede traer al frente
+//      sola. Por eso se lo pedimos al server: /api/frente levanta la ventana con
+//      AppleScript. Se pide UNA vez y sólo si la ventana no tiene el foco.
+//   2) el foco DENTRO de la página, que sí es nuestro: va al textarea de xterm. Un
+//      solo focus() no alcanza (el navegador termina de digerir el drop DESPUÉS de
+//      este handler y lo pisa), así que se insiste hasta VERIFICAR que quedó donde
+//      tiene que estar, no hasta que se acaben unos disparos a ciegas.
+// Si en ~1,7 s no lo logró, lo dice en pantalla: quedarse callado es dejar a el usuario
+// tecleando contra la nada, que es exactamente lo que se viene a arreglar.
 let focoTimers = [];
+let focoDesde = 0;
 function enfocarSesion(){
-  const a = abiertas[activa];
   // En el teléfono NO se enfoca xterm: su textarea oculto rompe el teclado de
   // iOS (por eso queda inputmode="none"). Ahí el foco va al cajón de abajo.
   if(MOVIL){ const ta = $("#texto-m"); if(ta) ta.focus(); return; }
+  const a = abiertas[activa];
   if(!a) return;
-  focoTimers.forEach(clearTimeout);
-  focoTimers = [0, 60, 180, 400].map(ms => setTimeout(() => {
+  focoTimers.forEach(clearTimeout); focoTimers = [];
+  focoDesde = Date.now();
+  const listo = () => {
+    if(!document.hasFocus()) return false;          // el teclado lo tiene otra app
+    const ta = (a.term && a.term.textarea) || null; // xterm 5.5 lo expone
+    if(ta) return document.activeElement === ta;
+    const el = a.term && a.term.element;            // por si algún día no lo expone
+    return !!(el && el.contains(document.activeElement));
+  };
+  let pedidoFrente = false, intentos = 0;
+  const paso = () => {
+    if(listo()) return;
+    if(!document.hasFocus() && !pedidoFrente){
+      pedidoFrente = true;
+      fetch("/api/frente", {method:"POST"}).catch(()=>{});
+    }
     try{ window.focus(); a.term.focus(); }catch(e){}
-  }, ms));
+    if(++intentos < 24) focoTimers.push(setTimeout(paso, 70));
+    else aviso("No pude devolverte el foco: dale un clic a la sesión", true);
+  };
+  paso();
 }
-// Si en medio de la insistencia tocás otra cosa (la barra, un botón), mandás
-// vos: se cortan los reintentos para no robarte el foco de vuelta.
+// Si en medio de la insistencia tocás otra cosa (la barra, un botón), mandás vos:
+// se cortan los reintentos para no robarte el foco de vuelta. Los primeros 300 ms
+// no cuentan: al soltar, el propio arrastre deja caer eventos de puntero sobre la
+// página y con eso se cancelaba la insistencia antes de que empezara.
 document.addEventListener("pointerdown", () => {
+  if(Date.now() - focoDesde < 300) return;
   focoTimers.forEach(clearTimeout); focoTimers = [];
 }, true);
 
@@ -3486,14 +4483,8 @@ document.addEventListener("paste", async e => {
 let paletaOpts = [], paletaSel = 0;
 
 function opcionesPaleta(q){
-  const norm = s => String(s || "").toLowerCase()
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "");   // "meta ads" encuentra "Metá"
-  // Por PALABRAS, no por substring: si el proyecto arranca con un emoji o
-  // tiene algo en el medio, buscar la frase seguida no encuentra nada. Con
-  // palabras sueltas, el orden y lo que haya entremedio dejan de importar.
-  const palabras = norm(q).trim().split(/\s+/).filter(Boolean);
-  const casaCon = txt => { const s = norm(txt); return palabras.every(w => s.includes(w)); };
-  const casa = o => casaCon(o.titulo + " " + o.proyecto + " " + (o.ultimo_txt||""));
+  const casaCon = buscador(q);
+  const casa = o => casaCon(textoDe(o));
   const out = [];
   estado.tabs.map(x => Object.assign({__tab:true}, x)).filter(casa).forEach(o =>
     out.push({icono:"●", qué:o.titulo, dónde:o.proyecto, estado:o.estado,
@@ -3589,6 +4580,49 @@ async function refrescar(){
   }
 }
 
+/* ── Uso del plan: el tubo de abajo de la barra ──────────────────────────────
+   Relleno = % usado; rayita = % que corresponde a esta altura de la ventana.
+   Se muestran la semana general y Fable siempre; la sesión de 5 h sólo cuando
+   pica (≥50%), que es cuando importa. "Sin dato" se dice, no se adivina. */
+function pintarUsoHTML(j){
+  const el = $("#uso");
+  if(!el) return;
+  if(!j || !j.ok){
+    el.innerHTML = '<div class="u-lin" title="' + esc((j && j.error) || "") +
+                   '">uso del plan: sin dato</div>';
+    return;
+  }
+  const coma = n => String(n).replace(".", ",");
+  el.innerHTML = j.topes.filter(t =>
+      t.nombre !== "sesión 5 h" || t.pct >= 50
+    ).map(t => {
+      const ritmo = t.ritmo || 0;
+      const clase = ritmo <= 1.15 ? "" : (ritmo <= 1.6 && !t.se_acaba ? "ocre"
+                    : (t.se_acaba ? "rojo" : "ocre"));
+      const tip = [
+        t.pct + "% usado",
+        t.esperado != null ? "a esta altura corresponde " + Math.round(t.esperado) + "%" : "",
+        ritmo ? "ritmo " + coma(ritmo.toFixed(1)) + "× de lo que da el cupo" : "",
+        t.se_acaba ? "así como venís se acaba el " + t.se_acaba : "",
+        t.resetea ? "resetea " + t.resetea : "",
+      ].filter(Boolean).join("\n");
+      return '<div class="u-lin" title="' + esc(tip) + '">' +
+        '<span class="u-eti">' + esc(t.nombre === "sesión 5 h" ? "5 h" : t.nombre) + '</span>' +
+        '<span class="u-tubo"><span class="u-fill ' + clase + '" style="width:' +
+          Math.min(100, t.pct) + '%"></span>' +
+        (t.esperado != null ? '<span class="u-marca" style="left:' +
+          Math.min(100, t.esperado) + '%"></span>' : "") +
+        '</span><span class="u-pct ' + (clase === "rojo" ? "rojo" : "") + '">' +
+        Math.round(t.pct) + '%</span></div>';
+    }).join("");
+}
+async function pintarUso(){
+  try{
+    const r = await fetch("/api/uso");
+    pintarUsoHTML(await r.json());
+  }catch(err){ pintarUsoHTML(null); }
+}
+
 (async () => {
   await refrescar();
   // arranque: si no hay ninguna pestaña viva, abrir una en el proyecto principal
@@ -3599,6 +4633,8 @@ async function refrescar(){
     abrirTab(estado.tabs.filter(t => t.viva).slice(-1)[0].id);
   }
   setInterval(() => { refrescar(); pintarVer(); }, 4000);
+  pintarUso();
+  setInterval(pintarUso, 5 * 60 * 1000);
 })();
 </script>
 </body>
@@ -3629,6 +4665,9 @@ class Servidor(ThreadingHTTPServer):
 
 if __name__ == "__main__":
     server = Servidor((BIND, PORT), Handler)
+    # se pregunta acá y no en la primera pestaña, para que abrir una no espere al
+    # `claude --help` (y para que el aviso de CLI viejo salga al arrancar, no después)
+    threading.Thread(target=_soporta_session_id, daemon=True).start()
     print(f"Cacho en http://{BIND}:{PORT}  (Ctrl-C para cortar)")
     try:
         server.serve_forever()

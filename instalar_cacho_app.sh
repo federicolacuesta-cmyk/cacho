@@ -56,9 +56,12 @@ fi
 # tiene que entrar sola. OJO con CÓMO entra:
 #   · El PIN NO viaja como argumento. Se le pasa al server por la ENTRADA ESTÁNDAR
 #     de curl, porque todo lo que va en una línea de comandos lo lee cualquier
-#     proceso de la máquina con un `ps`.
+#     proceso de la máquina con un \`ps\`.
+#     (Los backticks van ESCAPADOS: este heredoc interpola —necesita \$SERVE— y un
+#     backtick pelado SE EJECUTA al instalar. Pasó el 15-ago: la salida de ps quedó
+#     incrustada en el lanzador como líneas sueltas que bash intentaba correr.)
 #   · Lo que sí termina en la URL de Chrome es un TICKET de un solo uso que vence
-#     en 60 s. Antes iba el PIN ahí, y quedaba a la vista en `ps` todas las horas
+#     en 60 s. Antes iba el PIN ahí, y quedaba a la vista en \`ps\` todas las horas
 #     que la ventana estuviera abierta.
 # Server viejo (sin /api/ticket): se cae al PIN en la URL, como antes.
 PIN=\$(cat "\$HOME/.cacho_pin" 2>/dev/null || true)
