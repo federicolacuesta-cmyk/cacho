@@ -41,6 +41,27 @@ Cacho junta todo eso en una sola app:
   que `claude` levante y le tipea el prompt — ideal para que tus rutinas programadas corran
   *adentro* de Cacho en vez de en ventanas sueltas.
 
+Y encima de eso, lo que fue apareciendo con el uso diario:
+
+- **Cada charla agrupada por ÁREA, con su cara y su color** (`areas.py`). El área no es el
+  tema: es *con quién hablás* — la máquina propone leyendo la conversación (sin modelo:
+  cuenta palabras, es instantáneo y si no reconoce nada no rotula) y vos corregís de un
+  toque. Tocás una cara en la tira y ves solo lo de esa área. Es un ejemplo editable:
+  nombres, colores, caras y vocabulario son tuyos.
+- **Saber de qué va cada charla sin abrirla**: el renglón dice el tema, qué está haciendo
+  ahora (verbo + archivo) y **tu último pedido** — no el último mensaje, que suele ser "dale".
+- **Cuánto pesa la charla**: un semáforo por sesión con el contexto acumulado, porque en cada
+  turno se relee todo lo anterior y el costo crece al cuadrado. Te dice cuándo conviene cortar
+  y abrir una nueva.
+- **Avisos cuando una sesión te espera**: notificación del sistema + bip + `(N) Cacho` en el
+  título de la ventana + 🔔 en el renglón hasta que la abrís.
+- **Buscador arriba de la lista** (y ⌘K de paleta): busca por título, tema, contexto y último
+  pedido, por palabras sueltas y sin tildes.
+- **Dictar por micrófono** (botón 🎙, escritorio y teléfono) y **⌘V para pegar capturas** del
+  portapapeles directo en la sesión.
+- **Elegir el modelo** por pestaña, o dejar tu default en `~/.cacho_modelo`.
+- **Fijar sesiones**, ponerles nombre propio, y lo terminado plegado abajo para que no moleste.
+
 Sin dependencias: Python 3 puro (stdlib), [xterm.js](https://github.com/xtermjs/xterm.js)
 vendoreado en `static/`.
 
@@ -103,7 +124,9 @@ port-forward, o compartir el PIN.
   página (HTML/CSS/JS inline). Un solo archivo a propósito: se lee de punta a punta.
 - `cacho_lanzar.py` — abre una tarea como pestaña dentro de Cacho (para automatizaciones).
 - `instalar_cacho_app.sh` — genera `Cacho.app` en `~/Applications` con la ruta real del clon.
-- `static/` — xterm.js (MIT) + el logo.
+- `areas.py` — las áreas (cara, color, vocabulario) y el clasificador que las propone.
+- `costo_sesion.py` — el peso de cada charla (contexto acumulado) en criollo.
+- `static/` — xterm.js (MIT) + el logo y las caras de las áreas.
 
 ## Créditos
 
