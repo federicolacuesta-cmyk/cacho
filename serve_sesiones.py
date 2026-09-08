@@ -67,6 +67,14 @@ for _d in (os.path.dirname(_AQUI), _AQUI):
     if _d not in sys.path:
         sys.path.insert(0, _d)
 import areas                                # noqa: E402 — las áreas: cara, color, palabras
+# Con qué arranca una pestaña con área. Vive en el repo de la casa, no en el de Cacho:
+# afuera el módulo no está y Cacho tiene que abrir igual — una pestaña con área arranca
+# sin system prompt, como cualquier otra. Importarlo pelado dejaba el Cacho público sin
+# abrir (ModuleNotFoundError antes del server), y ahí es donde menos ojos hay para verlo.
+try:
+    import agente_arranque                  # noqa: E402
+except ImportError:
+    agente_arranque = None
 import costo_sesion
 # El uso del plan (tubo de la barra lateral). Guardado: en el repo público de Cacho
 # este módulo no viaja, y sin él Cacho tiene que abrir igual — muestra "sin dato".
@@ -74,6 +82,15 @@ try:
     import uso_claude
 except ImportError:
     uso_claude = None
+
+# La firma de tu casa (logo + bandera) para la pantalla de entrada, si tenés un módulo
+# `marca_web` con `firma_html(color, alto=, gap=)` dos carpetas más arriba. Si no está,
+# la pantalla abre igual, sin firma.
+try:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(_AQUI)))
+    import marca_web as _marca
+except ImportError:
+    _marca = None
 
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 CARPETA_PROYECTOS = os.path.expanduser("~/Claude/Projects")
@@ -346,13 +363,6 @@ def _ticket_usar(tok):
     return False
 
 
-def _sesiones_borrar_todas():
-    """Echa a todos los dispositivos (para cuando algo huele mal)."""
-    with _SES_LOCK:
-        _sesiones.clear()
-        _sesiones_guardar()
-
-
 _sesiones_cargar()
 
 
@@ -555,7 +565,7 @@ VENTANA_TEMA = 24
 CONFIRMACIONES = {
     "dale", "si", "sí", "ok", "oka", "okey", "listo", "bien", "perfecto", "genial",
     "gracias", "no", "nop", "sip", "claro", "exacto", "seguí", "segui", "continuá",
-    "continua", "continuá", "andá", "anda", "hacelo", "dale gracias", "buenísimo",
+    "continua", "andá", "anda", "hacelo", "dale gracias", "buenísimo",
     "buenisimo", "gracias!", "ahora sí", "ahora si", "bárbaro", "barbaro", "gracias.",
 }
 
@@ -1054,7 +1064,11 @@ def arranque_stream(buf, escritos, desde):
 
 
 class TermSession:
-    def __init__(self, cwd, resume_id="", modelo=""):
+    def __init__(self, cwd, resume_id="", modelo="", area=""):
+        # `area`: con quién se abre la charla. Hasta el 5-set-2026 sólo se guardaba como
+        # metadato (color, tira) y la sesión nacía PELADA: el usuario tocaba a Carla y hablaba
+        # con nadie. Ahora arranca sabiendo quién es y qué leer (agente_arranque.py).
+        self.area = area if (area and areas.valida(area)) else ""
         # `modelo`: pedido explícito para ESTA pestaña (p. ej. una cita premium que
         # necesita Fable). Vacío = el default de la máquina (~/.cacho_modelo).
         self.modelo_pedido = modelo
@@ -1130,6 +1144,14 @@ class TermSession:
             # entre comillas SIEMPRE: el sufijo de contexto va entre corchetes
             # (`claude-opus-5[1m]`) y zsh lo toma como glob → "no matches found".
             claude += " --model '" + modelo + "'"
+        # El área: quién es y qué leer, por system prompt. Es la ÚNICA forma de dárselo a una
+        # pestaña de la interfaz (no tiene prompt donde anteponer nada). El archivo se
+        # reescribe en cada arranque desde la memoria y la skill vigentes; la ruta la pone
+        # ese módulo (sin espacios ni comillas) y va entre comillas igual.
+        if self.area and agente_arranque:
+            arranque = agente_arranque.archivo(self.area)
+            if arranque:
+                claude += " --append-system-prompt-file '" + arranque + "'"
         cmd = (
             f'PATH="{_PATH_PESTANA}"; '
             f"if command -v claude >/dev/null; then {claude}; "
@@ -1594,15 +1616,6 @@ def abrir_terminal(tty):
     return False, "no encontré esa pestaña (¿Terminal cerrada?)"
 
 
-def abrir_app_claude():
-    try:
-        subprocess.run(["osascript", "-e", 'tell application "Claude" to activate'],
-                       capture_output=True, text=True, timeout=10)
-        return True, "listo"
-    except Exception as e:
-        return False, str(e)
-
-
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
@@ -1643,23 +1656,23 @@ def _es_local(nombre):
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    _cookie_pendiente = None   # token a entregar en esta respuesta (login por ?pin=)
 
     def _json(self, obj, code=200):
         cuerpo = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("X-Content-Type-Options", "nosniff")
-        if self._cookie_pendiente:
-            self.send_header("Set-Cookie",
-                             self._COOKIE_SESION.format(tok=self._cookie_pendiente))
-            self._cookie_pendiente = None
         self.send_header("Content-Length", str(len(cuerpo)))
         self.end_headers()
         self.wfile.write(cuerpo)
 
     def _body(self):
         n = int(self.headers.get("Content-Length") or 0)
+        if n < 0:
+            # negativo = rfile.read() lee hasta EOF: el hilo queda colgado hasta que el
+            # cliente corte, y /pin y /api/ticket se leen ANTES del PIN
+            n = 0
+            self.close_connection = True
         self._body_leido = True
         return self.rfile.read(n) if n else b""
 
@@ -1829,7 +1842,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _pagina_pin(self, error=False):
         aviso = ('<div class="err">PIN incorrecto</div>' if error else "")
-        cuerpo = PAGINA_PIN.replace("{{AVISO}}", aviso).encode()
+        firma = ('<div class="firma">%s</div>' % _marca.firma_html("negro", alto=30, gap=12)
+                 if _marca else "")
+        cuerpo = (PAGINA_PIN.replace("{{AVISO}}", aviso)
+                            .replace("{{MARCA}}", firma).encode())
         self.send_response(403 if error else 401)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         # Las MISMAS cabeceras que el resto de la app (16-ago-2026): esta pantalla
@@ -2247,7 +2263,7 @@ class Handler(BaseHTTPRequestHandler):
             area = q.get("area", [""])[0]
             if area and not areas.valida(area):
                 return self._json({"error": "área inválida"}, 400)
-            t = TermSession(cwd, resume_id=resume, modelo=modelo)
+            t = TermSession(cwd, resume_id=resume, modelo=modelo, area=area)
             if area and t.transcript_id:
                 _meta_set(t.transcript_id, {"area": area})
             with TABS_LOCK:
@@ -2264,6 +2280,11 @@ class Handler(BaseHTTPRequestHandler):
             if accion == "input":
                 try:
                     d = base64.b64decode(json.loads(self._body())["d"])
+                except (ValueError, KeyError, TypeError):
+                    # cuerpo que no es {"d": base64}: antes era traceback en stderr y
+                    # conexión cortada sin respuesta
+                    return self._json({"error": "cuerpo inválido"}, 400)
+                try:
                     t.escribir(d)
                     return self._json({"ok": True})
                 except OSError as e:
@@ -2352,10 +2373,7 @@ end tell""" % PORT)
             return self._json({"ruta": destino})
 
         if ruta == "/api/abrir":
-            if q.get("app", [""])[0] == "claude":
-                ok, msg = abrir_app_claude()
-            else:
-                ok, msg = abrir_terminal(q.get("tty", [""])[0])
+            ok, msg = abrir_terminal(q.get("tty", [""])[0])
             return self._json({"ok": ok, "msg": msg})
 
         self._json({"error": "no existe"}, 404)
@@ -2381,7 +2399,10 @@ PAGINA_PIN = r"""<!doctype html>
   body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
        background:#FAF9F5;color:#1F1E1B;font-family:-apple-system,system-ui,sans-serif}
   .caja{text-align:center;padding:32px}
-  .caja img{width:96px;height:96px;border-radius:22px}
+  /* Hija DIRECTA: es la cara de Cacho. Un `.caja img` a secas le cae también al logo de
+     la firma y se lo redondea como si fuera un avatar. */
+  .caja>img{width:96px;height:96px;border-radius:22px}
+  .firma{margin:0 0 20px;padding-bottom:16px;border-bottom:1px solid #E3E0D5}
   h1{font-size:22px;margin:14px 0 2px}
   p{color:#6E6C64;margin:4px 0 18px;font-size:14px}
   input{font-size:26px;letter-spacing:8px;text-align:center;width:190px;padding:10px;
@@ -2393,6 +2414,7 @@ PAGINA_PIN = r"""<!doctype html>
 </head>
 <body>
   <form class="caja" method="post" action="/pin">
+    {{MARCA}}
     <img src="/static/cacho.png" alt="">
     <h1>Cacho</h1>
     <p>PIN de esta máquina (está en ~/.cacho_pin)</p>

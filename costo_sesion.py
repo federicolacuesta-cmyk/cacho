@@ -101,7 +101,7 @@ def de_archivo(path: str, cola_bytes: int = 262_144) -> tuple[int, str]:
 
 
 if __name__ == "__main__":
-    import glob, os, sys
+    import glob, os, time
     base = os.path.expanduser("~/.claude/projects")
     filas = []
     for f in glob.glob(os.path.join(base, "**", "*.jsonl"), recursive=True):
@@ -111,7 +111,7 @@ if __name__ == "__main__":
         if ctx:
             filas.append((ctx, v, os.path.basename(f)[:8], os.stat(f).st_mtime))
     filas.sort(reverse=True)
-    hoy = [f for f in filas if f[3] > __import__("time").time() - 86400]
+    hoy = [f for f in filas if f[3] > time.time() - 86400]
     print(f"{len(filas)} sesiones con datos · {len(hoy)} tocadas en las últimas 24 h\n")
     ico = {ROJO: "🔴", AMARILLO: "🟡", VERDE: "🟢"}
     for ctx, v, sid, _ in (hoy or filas)[:15]:

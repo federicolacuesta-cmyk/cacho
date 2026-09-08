@@ -13,7 +13,8 @@ EL ÁREA NO ES EL TEMA: ES **CON QUIÉN HABLÁS**. Definidas así son mutuamente
 excluyentes y no hay que discutir dos veces dónde va cada cosa:
 
     Cacho    → vos y la máquina (el repo, la infra, lo que no le sirve a nadie de afuera)
-    Carla    → los clientes            Jaime  → el mercado
+    Carla    → el mundo, por el WhatsApp del usuario (proveedores, encargados, vendedores, colaboradores)
+    Jaime    → el mercado
     Eterna   → los locales             Xara   → proveedores y bancos
     Waldemar → la mercadería (qué comprás, a quién, a cuánto, qué rota)
 
@@ -55,20 +56,22 @@ AREAS = [
                      "auditor", "memoria ram", "disco", "backup", "respaldo", "sync"],
     },
     {
-        "clave": "carla", "nombre": "Carla", "rol": "Atención al cliente",
-        "gente": "los clientes", "color": "#C2418C", "cara": "carla.png",
-        # «whatsapp» sola no alcanza: por WhatsApp también salen informes internos, que
-        # son de Eterna. Lo que distingue a Carla es el CLIENTE.
-        "propias": ["carla", "reseña", "resena", "call center",
-                    "atención al cliente", "atencion al cliente"],
-        "palabras": ["cliente escribió", "consulta de un cliente", "responder al cliente",
-                     "los clientes"],
+        "clave": "carla", "nombre": "Carla", "rol": "Secretaria del usuario",
+        "gente": "quien le escribe a el usuario", "color": "#C2418C", "cara": "carla.png",
+        # CORREGIDO 3-set-2026 (el usuario): Carla NO atiende clientes — eso es el call center (092/096).
+        # Carla es la interlocutora del usuario con el mundo por SU WhatsApp (099): proveedores,
+        # encargados, vendedores, colaboradores. «La secretaria de Cacho»: Cacho hace, Carla
+        # habla por el usuario. Lo que la distingue es el ACTO de contestar en nombre del usuario, no
+        # quién está del otro lado. Reseñas y call center son del mercado → Jaime.
+        "propias": ["carla", "mi whatsapp"],
+        "palabras": ["me escribió", "contestale", "respondele", "escribile"],
     },
     {
         "clave": "jaime", "nombre": "Jaime", "rol": "Marketing",
         "gente": "el mercado", "color": "#0072CE", "cara": "jaime.png",
         "propias": ["jaime", "pauta", "creativ", "publicid", "tiktok", " ads", "seo",
-                    "campaña", "campana de"],
+                    "campaña", "campana de", "reseña", "resena", "call center",
+                    "atención al cliente", "atencion al cliente"],
         "palabras": ["anuncio", "posteo", "reel", "audiencia", "instagram", "blog",
                      "landing", "carrusel"],
     },
@@ -168,7 +171,8 @@ if __name__ == "__main__":
         "arreglando el sync de launchd que quedó con error en el servidor",
         "capacitación de los vendedores del mostrador",
         "los costos bancarios y la factura del proveedor",
-        "Carla, hay que responder al cliente de la reseña",
+        "Carla, contestale al proveedor que me escribió",
+        "hay que responder al cliente de la reseña",
         "me pasaron la lista de precios del mayorista, qué comprar",
         "cuánto stock muerto tenemos y qué liquidar",
         "hola",

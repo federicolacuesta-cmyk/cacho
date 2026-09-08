@@ -86,7 +86,7 @@ def _token(renovar=False):
         cabeceras = r.headers
     except urllib.error.HTTPError as e:
         if e.code not in (301, 302, 303, 307, 308):
-            raise SystemExit(f"Cacho rechazó el PIN al pedir token: HTTP {e.code}")
+            raise SystemExit(f"Cacho rechazó el PIN al pedir token: HTTP {e.code}") from e
         cabeceras = e.headers
     for c in cabeceras.get_all("Set-Cookie") or []:
         if c.startswith("cacho_sesion="):
@@ -236,10 +236,32 @@ def tipear(tid, prompt, esperar=ESPERA_CLAUDE_S):
     return True
 
 
+def con_memoria_del_area(prompt, area=""):
+    """Antepone al prompt la lectura de la memoria del agente, si existe.
+
+    Desde el 3-set-2026 la memoria está partida por agente: MEMORY.md (precargado) lleva lo
+    transversal y las 🚨, y lo ⭐/⚠️ de cada área vive en .claude/memory/MEMORY-<area>.md.
+    Una pestaña que ya declara su área sabe qué índice le toca: se lo pide en la primera
+    línea del prompt, que es el único mecanismo que el harness respeta (no hay hook de
+    "precargá esto también"). Sin área, o sin archivo, el prompt sale como vino.
+    """
+    if not area:
+        return prompt
+    # Nivel 2 de ARQUITECTURA.md (5-set-2026): la memoria del área (⭐/⚠️) y la SKILL del área
+    # (la crónica de sus circuitos, que salió de CLAUDE.md para que el nivel 1 entre en su tope).
+    # Van las dos en la primera línea: es el único mecanismo de precarga que el harness respeta.
+    # Sin área, la skill se dispara sola por su description; con área, no se deja al azar.
+    # Una sola puerta decide qué lee cada área: la misma que usa el server de Cacho para la
+    # pestaña de la interfaz (`agente_arranque`). Acá va antepuesto al prompt porque la
+    # pestaña automática SÍ tiene prompt; allá va por system prompt porque no lo tiene.
+    import agente_arranque
+    return agente_arranque.linea_de_prompt(area) + prompt
+
+
 def lanzar(prompt, area=""):
     """Crea la pestaña y le deja el prompt corriendo. Devuelve el id de pestaña."""
     tid = crear_pestana(area=area)
-    tipear(tid, prompt)
+    tipear(tid, con_memoria_del_area(prompt, area))
     return tid
 
 
@@ -254,9 +276,9 @@ def main():
     try:
         tid = crear_pestana(area=area)
         print(f"pestaña {tid} creada; esperando que levante claude ({ESPERA_CLAUDE_S}s)…")
-        tipear(tid, sys.argv[1].strip())
+        tipear(tid, con_memoria_del_area(sys.argv[1].strip(), area))
     except RuntimeError as e:
-        raise SystemExit(str(e))
+        raise SystemExit(str(e)) from e
     print(f"OK — tarea corriendo en Cacho (pestaña {tid}).")
 
 
