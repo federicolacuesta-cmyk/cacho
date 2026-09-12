@@ -17,11 +17,14 @@ excluyentes y no hay que discutir dos veces dónde va cada cosa:
     Jaime    → el mercado
     Eterna   → los locales             Xara   → proveedores y bancos
     Waldemar → la mercadería (qué comprás, a quién, a cuánto, qué rota)
+    Ferguson → la obra de un local nuevo (arquitecto, constructor, habilitaciones)
 
 Es un EJEMPLO armado para un comercio con locales: editá nombres, colores, caras y
 vocabulario a gusto (las caras viven en `static/`). Regla que conviene respetar:
-**seis es el techo** — razonar con categorías de color se cae después de 8 y la guía
-de interfaces dice 3 a 5. Si te hace falta una séptima, sacá otra.
+**siete es el techo** — razonar con categorías de color se cae después de 8 y la guía
+de interfaces dice 3 a 5. Si te hace falta una octava, sacá otra. La séptima de este
+ejemplo (Ferguson, obras) existe porque abrir un local es otra conversación que
+operarlo: si tu negocio no abre locales, borrala.
 
 LA CARA IDENTIFICA, EL COLOR REFUERZA. Nunca al revés y nunca el color solo. Es lo que
 hace que esto siga funcionando con sol de frente, en el celular, o para alguien que no
@@ -106,6 +109,19 @@ AREAS = [
                     "estado de cuenta", "proveedor"],
         "palabras": ["banco", "factura", "iva", "saldo", "balance", "boleta", "cheque",
                      "gasto"],
+    },
+    {
+        "clave": "ferguson", "nombre": "Ferguson", "rol": "Obras",
+        "gente": "la obra del local nuevo", "color": "#D97706", "cara": "ferguson.png",
+        # Sólo obra, nada comercial: «proveedor» y «factura» a secas son de Xara (hay que
+        # pagarle) y «local» de Eterna (ya abrió). Lo de Ferguson es el léxico de la OBRA.
+        "propias": ["ferguson", "obra", "arquitecta", "arquitecto", "constructor",
+                    "cronograma de obra", "libro de obra", "acta de ocupacion",
+                    "acta de ocupación", "fin de obra", "inauguracion", "inauguración",
+                    "prevencionista", "bomberos", "habilitacion", "habilitación"],
+        "palabras": ["apertura", "local nuevo", "cortina", "vidriera", "entrepiso",
+                     "yeso", "electrica", "eléctrica", "sanitaria", "shopping nuevo",
+                     "fit-out", "mobiliario", "herrero"],
     },
 ]
 POR_CLAVE = {a["clave"]: a for a in AREAS}

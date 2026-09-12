@@ -56,7 +56,7 @@ from datetime import datetime
 from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from queue import Empty, Queue
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 # `areas.py` vive en `tools/` en este repo y en la RAÍZ del repo público de Cacho (que se
 # arma con publicar_cacho.py y aplana el árbol). Se prueban los dos lugares en vez de dar por
@@ -75,7 +75,20 @@ try:
     import agente_arranque                  # noqa: E402
 except ImportError:
     agente_arranque = None
+# Quién entra y con qué jaula (el usuario vs. Administración). Mismo criterio que los de arriba:
+# en el repo público de Cacho este módulo puede no estar, y Cacho tiene que abrir igual — sin
+# él, el único que entra es el del PIN de la máquina, que es como fue hasta el 10-set-2026.
+try:
+    import cacho_perfiles                   # noqa: E402
+except ImportError:
+    cacho_perfiles = None
 import costo_sesion
+# La bandeja de archivos de cada sesión (11-set-2026): qué pasó por la charla y sus
+# miniaturas. Guardado como los otros: si no viaja, Cacho abre sin bandeja.
+try:
+    import cacho_bandeja
+except ImportError:
+    cacho_bandeja = None
 # El uso del plan (tubo de la barra lateral). Guardado: en el repo público de Cacho
 # este módulo no viaja, y sin él Cacho tiene que abrir igual — muestra "sin dato".
 try:
@@ -98,6 +111,7 @@ AQUI = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get("CACHO_PORT", "8811"))
 BIND = "127.0.0.1"   # NO cambiar a 0.0.0.0: expondría terminales por red
 CHUNK = 256 * 1024   # bytes que se leen de cabeza/cola de cada transcript
+TOPE_COLA = 8 * 1024 * 1024   # hasta dónde se retrocede buscando una línea entera en la cola
 TOPE_BUFFER = 2_000_000  # scrollback que se guarda por terminal
 COALESCE_MAX = 64 * 1024  # tope al juntar trozos del PTY en un solo evento SSE (ver _stream)
 # Tope de lo que se re-manda al ENTRAR de nuevo a una pestaña, cuando no se puede
@@ -202,6 +216,22 @@ def _pin_igual(recibido, esperado=None):
         return False
 
 
+def _quien_es(pin):
+    """(perfil, quien) para un PIN. `(None, "")` si no es de nadie.
+
+    Es el único lugar donde se decide quién es quién: el PIN de la máquina es el usuario; los de
+    `inputs/administracion/acceso.json` son las chicas de Administración, y su pestaña nace
+    enjaulada (ver `cacho_perfiles.py`). El orden importa poco pero se prueba primero el de
+    el usuario, que es el que se usa cien veces por día."""
+    if _pin_igual(pin):
+        return "duenio", ""
+    if cacho_perfiles is not None:
+        quien = cacho_perfiles.quien_por_pin(pin)
+        if quien:
+            return cacho_perfiles.ADMIN, quien
+    return None, ""
+
+
 def _log_seguridad(texto):
     """Deja rastro de los intentos. El server no loguea NADA (log_message está
     anulado a propósito, ensuciaba la consola), así que sin esto un ataque de
@@ -260,7 +290,7 @@ SESIONES_FILE = os.path.join(SESION_DIR, "sesiones_web.json")
 SESION_MAX = 20                  # dispositivos recordados a la vez
 SESION_VIDA = 365 * 24 * 3600    # un año sin usarse y se cae solo
 
-_sesiones = {}        # token -> último uso (epoch)
+_sesiones = {}        # token -> {"t": último uso (epoch), "perfil", "quien"}
 _SES_LOCK = threading.Lock()
 
 
@@ -289,8 +319,16 @@ def _sesiones_cargar():
             d = json.load(fh)
         if isinstance(d, dict):
             ahora = time.time()
-            _sesiones = {k: float(v) for k, v in d.items()
-                         if isinstance(k, str) and ahora - float(v) < SESION_VIDA}
+            _sesiones = {}
+            for k, v in d.items():
+                if not isinstance(k, str):
+                    continue
+                try:
+                    f = _ficha(v)
+                except (TypeError, ValueError):
+                    continue          # una entrada ilegible se cae sola, no echa a las demás
+                if ahora - f["t"] < SESION_VIDA:
+                    _sesiones[k] = f
     except FileNotFoundError:
         _sesiones = {}          # primera vez en esta máquina: normal
     except Exception as e:
@@ -302,28 +340,45 @@ def _sesiones_cargar():
                        "de TODOS los dispositivos; hay que re-tipear el PIN")
 
 
-def _sesion_nueva():
+def _sesion_nueva(perfil="duenio", quien=""):
+    """El token ya no dice sólo «entró»: dice QUIÉN entró (10-set-2026).
+
+    Hasta hoy Cacho tenía una sola identidad y el token era un timestamp suelto. Con
+    Administración adentro, el perfil tiene que viajar con la sesión: es lo que decide si la
+    pestaña nace con shell o enjaulada, y qué pestañas ve. Los tokens viejos (un float) siguen
+    valiendo como perfil `duenio` — cambiar el formato no puede echar a los dispositivos del usuario,
+    que es lo que pasaría si el archivo persistido dejara de entenderse."""
     import secrets
     tok = secrets.token_urlsafe(32)
     with _SES_LOCK:
-        _sesiones[tok] = time.time()
+        _sesiones[tok] = {"t": time.time(), "perfil": perfil, "quien": quien}
         sobran = len(_sesiones) - SESION_MAX
         if sobran > 0:               # se van las más viejas
-            for k in sorted(_sesiones, key=_sesiones.get)[:sobran]:
+            for k in sorted(_sesiones, key=lambda k: _sesiones[k]["t"])[:sobran]:
                 del _sesiones[k]
         _sesiones_guardar()
     return tok
 
 
+def _ficha(v):
+    """Una entrada del archivo, venga del formato viejo (float) o del nuevo (dict)."""
+    if isinstance(v, dict):
+        return {"t": float(v.get("t") or 0), "perfil": v.get("perfil") or "duenio",
+                "quien": v.get("quien") or ""}
+    return {"t": float(v), "perfil": "duenio", "quien": ""}
+
+
 def _sesion_valida(tok):
+    """La ficha de la sesión, o None. Sigue siendo falsy cuando no vale, así que los `if` de
+    siempre no cambian de sentido."""
     if not tok:
-        return False
+        return None
     with _SES_LOCK:
         for k in _sesiones:
             if hmac.compare_digest(k, tok):
-                _sesiones[k] = time.time()
-                return True
-    return False
+                _sesiones[k]["t"] = time.time()
+                return dict(_sesiones[k])
+    return None
 
 
 # ─── Tickets de un solo uso (para el lanzador de la app) ──────────────────────
@@ -404,6 +459,38 @@ def _texto_de(content):
         if tools:
             return None, tools
     return None, None
+
+
+def _fin_de(d):
+    """Cómo termina la charla, según el ÚLTIMO registro que importa del transcript
+    (11-set-2026). Es lo que decide «te espera»; el pty solo lo dirime en un caso.
+      termino     → Claude cerró el turno (habló y paró): te espera, sí o sí.
+      pensando    → le escribiste, le volvió una herramienta, o dejaste un mensaje
+                    en la cola mientras trabajaba: NO te espera, aunque el pty esté
+                    quieto (pensar largo no dibuja nada).
+      herramienta → pidió una herramienta y todavía no volvió: o está corriendo
+                    (spinner → pty vivo) o está pidiendo permiso / una respuesta
+                    (pty quieto). Ahí sí manda el pty.
+      None        → este registro no dice nada (títulos, snapshots, cola vaciada).
+    RAÍZ: el estado salía de «pty quieto ≥ 8 s», y eso miente para los dos lados:
+    una pestaña nueva sin nada escrito quedaba «esperando» y entraba en el 🔔; una
+    que terminó pero sigue dibujando (aviso, barra) quedaba «trabajando» y no."""
+    t = d.get("type")
+    if t == "queue-operation":
+        return "pensando" if d.get("operation") == "enqueue" else None
+    if t == "system" and d.get("subtype") == "turn_duration":
+        # Al cerrar el turno Claude Code anota cuántos subagentes siguen corriendo: con
+        # alguno pendiente la sesión se despierta SOLA con la task-notification, no espera
+        # a nadie (58 turnos así en los transcripts de la casa; policía 11-set-2026).
+        return "pensando" if d.get("pendingBackgroundAgentCount") else None
+    if t not in ("user", "assistant") or d.get("isMeta") or d.get("isSidechain"):
+        return None
+    if t == "assistant":
+        stop = (d.get("message") or {}).get("stop_reason")
+        if stop is None:
+            return "pensando"          # mensaje a medio escribir: sigue en eso
+        return "herramienta" if stop == "tool_use" else "termino"
+    return "pensando"
 
 
 _RE_ARCHIVO = re.compile(
@@ -606,8 +693,17 @@ def _leer_sesion(path):
         head = fh.read(CHUNK)
         tail = b""
         if st.st_size > CHUNK:
-            fh.seek(max(CHUNK, st.st_size - CHUNK))
-            tail = fh.read()
+            # La cola tiene que traer al menos UNA línea entera: si el último registro es
+            # una imagen leída (1,35 MB en base64), 256 KB no alcanzan y el estado salía de la
+            # CABEZA del transcript (policía 11-set-2026). Se retrocede hasta encontrar un
+            # salto de línea anterior, con tope.
+            desde = max(CHUNK, st.st_size - CHUNK)
+            while True:
+                fh.seek(desde)
+                tail = fh.read()
+                if b"\n" in tail[:-1] or desde <= CHUNK or st.st_size - desde >= TOPE_COLA:
+                    break
+                desde = max(CHUNK, desde - 4 * CHUNK)
 
     head_lines = head.decode("utf-8", "replace").splitlines()
     if st.st_size > CHUNK:
@@ -622,6 +718,7 @@ def _leer_sesion(path):
         # de qué va AHORA (ver el bloque de temas, más arriba)
         "icono": "", "tema": "", "tema_ini": "", "area": areas.DEFECTO,
         "contexto": "", "pedido": "",
+        "fin": "",   # cómo termina la charla (ver _fin_de): decide «te espera»
         # cuánto pesa arrastrar esta charla (24-ago-2026). Sale de tail_lines,
         # que ya se leyó: no agrega ni una lectura de disco al refresco del panel.
         "ctx_tokens": 0, "peso": costo_sesion.VERDE, "peso_nota": "",
@@ -674,6 +771,8 @@ def _leer_sesion(path):
             s["cwd"] = d["cwd"]
         if d.get("gitBranch") and not s["branch"]:
             s["branch"] = d["gitBranch"]
+        if not s["fin"]:
+            s["fin"] = _fin_de(d) or ""
         if d.get("type") not in ("user", "assistant") or d.get("isMeta") or d.get("isSidechain"):
             continue
         contenido = (d.get("message") or {}).get("content")
@@ -794,12 +893,16 @@ _conv_lock = threading.Lock()
 def _leer_conversacion(path, max_msgs=150):
     """Conversación de un transcript para el visor de solo-lectura.
 
-    Lee la COLA del archivo. Cuánta cola NO puede ser fija: los transcripts largos
-    traen líneas sueltas de varios MB (los `file-history-snapshot`), así que con el
-    1 MB de antes una sesión de 40 MB mostraba TRES mensajes y parecía vacía
-    (medido 16-ago-2026: 44 MB → 3 mensajes). Ahora la ventana se agranda hasta
-    juntar conversación de verdad. El resultado se cachea por (mtime, tamaño):
-    el visor se repinta cada 4 s y una sesión terminada ya no cambia nunca."""
+    Lee la COLA del archivo hasta juntar la charla, NO hasta llenar un cupo de bytes.
+    Esa diferencia es todo el asunto (10-set-2026): una pestaña que mira creativos
+    guarda cada imagen que abre como base64 adentro del transcript —45 líneas de
+    hasta 1,3 MB sobre 22 MB totales, o sea el 90% del archivo en algo que no aporta
+    una palabra a la conversación—, así que la ventana de bytes se llenaba de
+    imágenes y las charlas de Jaime se veían con 12 mensajes de 250. Ahora la
+    escalera sube hasta el archivo entero y el corte lo pone `max_msgs`; el base64
+    se saca ANTES de parsear (era el costo que obligaba a leer poca cola).
+    El resultado se cachea por (mtime, tamaño): el visor se repinta cada 4 s y una
+    sesión terminada ya no cambia nunca."""
     st = os.stat(path)
     clave = (path, st.st_mtime, st.st_size)
     with _conv_lock:
@@ -808,10 +911,10 @@ def _leer_conversacion(path, max_msgs=150):
             return hit[1]
 
     titulo, items, recortado = "", [], False
-    for tope in (1024 * 1024, 8 * 1024 * 1024, 32 * 1024 * 1024):
+    for tope in (1024 * 1024, 8 * 1024 * 1024, 32 * 1024 * 1024, st.st_size):
         titulo, items = _parsear_cola(path, st, tope)
         recortado = st.st_size > tope
-        if len(items) >= 12 or not recortado:
+        if len(items) >= max_msgs or not recortado:
             break
     if len(items) > max_msgs:
         items = items[-max_msgs:]
@@ -822,6 +925,16 @@ def _leer_conversacion(path, max_msgs=150):
             _cache_conv.clear()
         _cache_conv[path] = (clave, salida)
     return salida
+
+
+# El base64 de una imagen adentro del transcript. Se lo saca ANTES de `json.loads`:
+# una sola de esas líneas pesa 1,3 MB, el visor la parsea entera y `_texto_de` la tira
+# igual (es un tool_result, no habla). Sacarlo es lo que hace barato leer la cola larga.
+_RE_B64 = re.compile(r'"data"\s*:\s*"[A-Za-z0-9+/=]{2000,}"')
+
+
+def _sin_imagenes(linea):
+    return _RE_B64.sub('"data":""', linea) if len(linea) > 100_000 else linea
 
 
 def _parsear_cola(path, st, TOPE):
@@ -835,7 +948,7 @@ def _parsear_cola(path, st, TOPE):
 
     titulo, items = "", []
     for line in lines:
-        d = _parse_linea(line)
+        d = _parse_linea(_sin_imagenes(line))
         if not d:
             continue
         if d.get("type") == "ai-title" and d.get("aiTitle"):
@@ -843,7 +956,7 @@ def _parsear_cola(path, st, TOPE):
         if d.get("type") not in ("user", "assistant") or d.get("isMeta") or d.get("isSidechain"):
             continue
         txt, tools = _texto_de((d.get("message") or {}).get("content"))
-        ts = (d.get("timestamp") or "")[11:16]  # HH:MM
+        ts = _hora_local(d.get("timestamp") or "")  # HH:MM
         if txt:
             limpio = _limpiar_multilinea(txt)
             if limpio:
@@ -879,6 +992,16 @@ def _proyecto_lindo(cwd):
 # persona— acierte sola sin que nadie configure nada.
 PROY_CASA = _proyecto_lindo(os.path.dirname(os.path.dirname(
     os.path.dirname(os.path.abspath(__file__)))))
+
+
+def _hora_local(ts):
+    """HH:MM en la hora de la máquina. El transcript viene en UTC («…Z»): hasta el
+    11-set-2026 el visor mostraba `ts[11:16]` crudo y toda la charla se leía tres
+    horas adelantada (lo destapó la bandeja de archivos, que la convertía bien)."""
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%H:%M")
+    except Exception:
+        return ts[11:16]
 
 
 def _iso_a_epoch(ts):
@@ -1019,6 +1142,31 @@ _PATH_PESTANA = ("$HOME/.local/bin:$HOME/.claude/local:$HOME/.npm-global/bin:"
                  "/opt/homebrew/bin:/usr/local/bin:$PATH")
 
 
+_CLAUDE_BIN = None
+_BIN_LOCK = threading.Lock()
+
+
+def _binario_claude():
+    """La RUTA del ejecutable, cacheada. Vacío si no está en esta máquina.
+
+    Una pestaña enjaulada NO puede nacer en una shell de login. El alias de la casa
+    (`~/.zshrc`) es `claude --dangerously-skip-permissions`: la bandera se la pone el alias,
+    no el código, así que un `--settings` con restricciones sería papel pintado mientras la
+    pestaña salga de esa shell. `command -v` devuelve el ejecutable, no el alias."""
+    global _CLAUDE_BIN
+    with _BIN_LOCK:
+        if _CLAUDE_BIN is None:
+            try:
+                r = subprocess.run(
+                    ["/bin/zsh", "-lc", f'PATH="{_PATH_PESTANA}"; command -v claude'],
+                    capture_output=True, text=True, timeout=30)
+                ruta = (r.stdout or "").strip().splitlines()[-1] if r.stdout.strip() else ""
+                _CLAUDE_BIN = ruta if ruta.startswith("/") and os.access(ruta, os.X_OK) else ""
+            except (OSError, subprocess.SubprocessError, IndexError):
+                _CLAUDE_BIN = ""
+    return _CLAUDE_BIN
+
+
 def _soporta_session_id():
     """Si el `claude` de esta máquina acepta --session-id (cacheado)."""
     global _SESSION_ID_OK
@@ -1064,7 +1212,17 @@ def arranque_stream(buf, escritos, desde):
 
 
 class TermSession:
-    def __init__(self, cwd, resume_id="", modelo="", area=""):
+    def __init__(self, cwd, resume_id="", modelo="", area="", jaula=None):
+        # `jaula`: la pestaña es de ADMINISTRACIÓN (ver cacho_perfiles.py). Cambia tres cosas
+        # y ninguna es cosmética: no hay shell, la carpeta es la suya (no el repo) y cada
+        # herramienta pasa por tools/xara_guardia.py antes de correr.
+        self.jaula = jaula or None
+        # De quién es esta pestaña. `duenio` es el dueño de siempre; con jaula, la persona.
+        # Sin esto, Flo abriría Cacho y vería —y podría escribir en— las pestañas del usuario.
+        self.duenio = (jaula or {}).get("quien") or "duenio"
+        if self.jaula:
+            cwd = self.jaula["cwd"]
+            area = self.jaula.get("area") or area
         # `area`: con quién se abre la charla. Hasta el 5-set-2026 sólo se guardaba como
         # metadato (color, tira) y la sesión nacía PELADA: el usuario tocaba a Carla y hablaba
         # con nadie. Ahora arranca sabiendo quién es y qué leer (agente_arranque.py).
@@ -1103,6 +1261,15 @@ class TermSession:
         # harían que las pestañas arranquen como "sesión hija" sin transcript
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
+        if self.jaula:
+            # Las claves de la casa viven en el entorno del server (tu módulo de claves las
+            # lee de ahí). Heredarlas en una pestaña enjaulada sería dejar las llaves
+            # adentro de la jaula: no hace falta que el modelo tenga mala intención, alcanza
+            # con que alguna herramienta imprima el entorno.
+            for k in list(env):
+                if re.search(r"KEY|TOKEN|SECRET|PASSW|_PW\b|CREDENTIAL", k, re.I):
+                    del env[k]
+            env.update(self.jaula.get("env") or {})
         master, slave = os.openpty()
         self.master = master
         self.tty = os.ttyname(slave)  # /dev/ttysNNN
@@ -1113,14 +1280,43 @@ class TermSession:
             os.setsid()
             fcntl.ioctl(slave, TIOCSCTTY, 0)
 
-        # shell interactiva de login: mismas alias/entorno que su Terminal
-        self.proc = subprocess.Popen(
-            ["/bin/zsh", "-il"], cwd=cwd, env=env,
-            stdin=slave, stdout=slave, stderr=slave,
-            preexec_fn=preexec, close_fds=True)
+        if self.jaula:
+            # SIN SHELL, a propósito (ver _binario_claude). Si el binario no está, la pestaña
+            # muere con un cartel en pantalla en vez de caer a una shell abierta: fallar hacia
+            # el lado seguro es lo único que puede hacer una jaula que no se pudo armar.
+            self.proc = subprocess.Popen(
+                self._orden_enjaulada(), cwd=cwd, env=env,
+                stdin=slave, stdout=slave, stderr=slave,
+                preexec_fn=preexec, close_fds=True)
+        else:
+            # shell interactiva de login: mismas alias/entorno que su Terminal
+            self.proc = subprocess.Popen(
+                ["/bin/zsh", "-il"], cwd=cwd, env=env,
+                stdin=slave, stdout=slave, stderr=slave,
+                preexec_fn=preexec, close_fds=True)
         os.close(slave)
         threading.Thread(target=self._leer, daemon=True).start()
-        threading.Thread(target=self._auto_claude, daemon=True).start()
+        if not self.jaula:
+            threading.Thread(target=self._auto_claude, daemon=True).start()
+
+    def _orden_enjaulada(self):
+        """La línea de comando de una pestaña de Administración."""
+        binario = _binario_claude()
+        if not binario:
+            return ["/bin/echo", "No encuentro Claude Code en esta máquina; avisale a el usuario."]
+        cmd = [binario, "--settings", self.jaula["settings"]]
+        modelo = self.modelo_pedido or _modelo_preferido()
+        if modelo:
+            cmd += ["--model", modelo]
+        if self.resume_id:
+            cmd += ["--resume", self.resume_id]
+        elif self.sid_propio:
+            cmd += ["--session-id", self.sid_propio]
+        if self.area and agente_arranque:
+            arranque = agente_arranque.archivo(self.area)
+            if arranque:
+                cmd += ["--append-system-prompt-file", arranque]
+        return cmd
 
     def _auto_claude(self):
         time.sleep(0.9)  # que la shell levante el prompt
@@ -1255,6 +1451,85 @@ _mapeo_pid = {}    # transcript_id -> pid del proceso claude que le corresponde
 # `_vincular_transcripts` la empareja (~1-5 s); hasta entonces simplemente no tiene meta.
 META_DIR = os.path.expanduser("~/Library/Application Support/Cacho")
 META_FILE = os.path.join(META_DIR, "sesiones.json")
+
+# ─── Las pestañas SOBREVIVEN al reinicio del server (11-set-2026) ─────────────────────
+# RAÍZ. Reiniciar Cacho (código nuevo → `reiniciar_cacho.sh`, o el diferido que espera el
+# hueco) mataba TODAS las pestañas vivas: quedaban retomables con ⟳ abajo, pero el usuario no las
+# retomaba — volvía, veía la barra vacía con UNA pestaña pelada abierta por el arranque, y
+# reabría las alertas desde el panel, rehaciendo de cero lo que ya estaba hecho. El 11-set
+# a las 11:49 el diferido encontró «hueco» (9 charlas quietas ≥38 min, teclado quieto 101
+# min: el usuario trabaja desde el teléfono) y se llevó 9 pestañas, incluida una de 10 MB de
+# Jaime y las de cierre de mes y policía; a las 13:15 el usuario reabrió 6 alertas y repitió el
+# trabajo. La regla del hueco estaba bien: la pestaña que ESPERA a el usuario es justamente la
+# que más vale, y ninguna heurística de "nadie la usa" la distingue de una abandonada.
+# Entonces el reinicio no decide: guarda lo que había y lo vuelve a abrir. Cada pestaña
+# vuelve con `--resume` sobre SU transcript, con su área y su modelo pedido; el id de
+# pestaña es nuevo (uuid corto de este arranque) y el front, al ver pestañas vivas, ya no
+# abre la pelada. Sólo se guardan las del usuario (la jaula la arma el server por quién entró).
+PESTANAS_AL_REINICIAR = os.path.join(META_DIR, "pestanas_al_reiniciar.json")
+
+
+def _guardar_pestanas_vivas():
+    """Anota las pestañas vivas para que el próximo arranque las reabra. Nunca lanza:
+    corre en el cierre, y un error acá no puede impedir que el server termine."""
+    try:
+        with TABS_LOCK:
+            vivas = [{"sid": t.transcript_id, "cwd": t.cwd, "area": t.area,
+                      "modelo": t.modelo_pedido}
+                     for t in TABS.values()
+                     if t.viva and t.transcript_id and not t.jaula]
+        os.makedirs(META_DIR, exist_ok=True)
+        tmp = PESTANAS_AL_REINICIAR + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(vivas, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, PESTANAS_AL_REINICIAR)
+        print(f"cierre: {len(vivas)} pestaña(s) anotadas para reabrir", file=sys.stderr)
+    except Exception as e:
+        print(f"⚠️ no pude anotar las pestañas vivas al cerrar: {e!r}", file=sys.stderr)
+
+
+def _restaurar_pestanas():
+    """Reabre (con --resume) las pestañas que el cierre anterior anotó. El archivo se
+    consume: si el server se cae dos veces seguidas, la segunda arranca limpia y no
+    reabre por duplicado. Una pestaña que no se pudo reabrir se dice, no se calla."""
+    try:
+        with open(PESTANAS_AL_REINICIAR, encoding="utf-8") as fh:
+            vivas = json.load(fh)
+    except FileNotFoundError:
+        return
+    except Exception as e:
+        print(f"⚠️ {PESTANAS_AL_REINICIAR} ilegible ({e!r}): no reabro nada", file=sys.stderr)
+        vivas = []
+    try:
+        os.remove(PESTANAS_AL_REINICIAR)
+    except OSError:
+        pass
+    abiertas = 0
+    for v in vivas if isinstance(vivas, list) else []:
+        sid, cwd = v.get("sid") or "", v.get("cwd") or ""
+        if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", sid) or not os.path.isdir(cwd):
+            print(f"⚠️ no reabro {sid[:8]!r}: sid o carpeta inválidos", file=sys.stderr)
+            continue
+        if not _buscar_transcript(sid):
+            print(f"⚠️ no reabro {sid[:8]}: su transcript ya no está", file=sys.stderr)
+            continue
+        with TABS_LOCK:
+            if len(TABS) >= MAX_TABS:
+                print(f"⚠️ tope de {MAX_TABS} pestañas: no reabro {sid[:8]}", file=sys.stderr)
+                break
+        try:
+            t = TermSession(cwd, resume_id=sid, modelo=v.get("modelo") or "",
+                            area=v.get("area") or "")
+        except Exception as e:
+            print(f"⚠️ no pude reabrir {sid[:8]}: {e!r}", file=sys.stderr)
+            continue
+        with TABS_LOCK:
+            TABS[t.id] = t
+        abiertas += 1
+    if vivas:
+        print(f"arranque: {abiertas} de {len(vivas)} pestaña(s) reabiertas tras el reinicio",
+              file=sys.stderr)
+
 _meta_cache = {"mtime": 0, "datos": {}}
 META_LOCK = threading.Lock()
 
@@ -1429,13 +1704,23 @@ def _cosechar_tabs(ahora, gracia=900):
         t.soltar()
 
 
-def estado_general():
+def estado_general(duenio="duenio"):
+    """La barra de Cacho, vista por QUIEN pregunta (10-set-2026).
+
+    Una sesión de Administración ve sus pestañas y sus charlas, no las del usuario. El filtro va
+    acá —en el que arma la respuesta— y no en el front: lo que no se manda no se puede
+    mostrar por error, y el front es lo único que un navegador puede cambiar."""
     ahora = time.time()
     _cosechar_tabs(ahora)
     parseadas = _sesiones_parseadas()
     meta = _meta_leer()
     with TABS_LOCK:
         tabs = list(TABS.values())
+    if duenio != "duenio":
+        propia = os.path.realpath(cacho_perfiles.TRABAJO) if cacho_perfiles else ""
+        tabs = [t for t in tabs if t.duenio == duenio]
+        parseadas = [p for p in parseadas
+                     if propia and os.path.realpath(p.get("cwd") or "/") == propia]
     usadas = _vincular_transcripts(tabs, parseadas)
 
     tabs_json = []
@@ -1444,20 +1729,30 @@ def estado_general():
         quieto = ahora - t.last_out
         if not t.viva:
             estado = "terminada"
-        elif p:
-            # Dos señales, y se piden LAS DOS para decir "trabajando": el
-            # transcript (que tarda hasta un minuto en enfriarse) y el pty. La
-            # TUI redibuja su spinner mientras piensa, así que pty quieto ≥8 s
-            # = terminó o está pidiendo permiso. Sin esto el aviso de "te
-            # espera" llegaba hasta un minuto tarde (o nunca, si la TUI quedó
-            # frenada en una pregunta con el transcript recién escrito).
+        elif p and p["fin"] == "termino":
+            # Claude cerró el turno: te espera, aunque la TUI siga dibujando.
+            estado = "esperando"
+        elif p and p["fin"] == "pensando":
+            # Le escribiste (o le volvió una herramienta): está en eso. El pty
+            # quieto no dice nada acá — pensar largo no dibuja. El único freno es
+            # un transcript frío CON pty quieto: se cayó y volvió al prompt.
             estado = ("trabajando"
-                      if (ahora - p["mtime"]) < 60 and quieto < 8 else "esperando")
+                      if quieto < 8 or (ahora - p["mtime"]) < 60 else "esperando")
+        elif p:
+            # En una herramienta (o transcript sin registro que diga nada): la
+            # TUI redibuja su spinner mientras corre, así que pty quieto ≥8 s =
+            # está pidiendo permiso o una respuesta. Ahí sí manda el pty.
+            estado = "trabajando" if quieto < 8 else "esperando"
         else:
             estado = "trabajando" if quieto < 6 else "esperando"
+        # «Te espera» ≠ «quieta»: una pestaña nueva sin nada escrito está quieta y
+        # no espera nada. Es lo que cuenta y muestra el 🔔 (11-set-2026).
+        te_espera = (estado == "esperando" and bool(p)
+                     and p["fin"] in ("termino", "herramienta"))
         tabs_json.append(_aplicar_meta({
             "id": t.id, "cwd": t.cwd, "proyecto": _proyecto_lindo(t.cwd),
             "titulo": t.titulo or "Nueva sesión", "estado": estado,
+            "te_espera": te_espera,
             "viva": t.viva, "quieto_seg": int(quieto),
             "hace_seg": int(ahora - (p["mtime"] if p else t.last_out)),
             "ultimo_quien": p["ultimo_quien"] if p else "",
@@ -1522,10 +1817,16 @@ def estado_general():
     for s in afuera:
         if s["viva"]:
             s["tipo"] = "terminal" if (s["tty"] and s["tty"] != "??") else "app"
-            s["estado"] = "trabajando" if (ahora - s["mtime"]) < 60 else "esperando"
+            # Sin pty a mano: el transcript manda y el mtime dirime lo demás.
+            fresca = (ahora - s["mtime"]) < 60
+            s["estado"] = ("esperando" if s["fin"] == "termino"
+                           else "trabajando" if fresca else "esperando")
+            s["te_espera"] = (s["estado"] == "esperando"
+                              and s["fin"] in ("termino", "herramienta"))
         else:
             s["tipo"] = "terminal"
             s["estado"] = "terminada"
+            s["te_espera"] = False
         if s["auto"] or _proyecto_lindo(s["cwd"]) == "Temporal":
             s["tipo"] = "automatica"
         s["proyecto"] = _proyecto_lindo(s["cwd"])
@@ -1771,6 +2072,40 @@ class Handler(BaseHTTPRequestHandler):
         afuera al dueño cada vez que alguien golpea la puerta."""
         return _sesion_valida(self._cookie("cacho_sesion"))
 
+    def _quien(self):
+        """El nombre de la persona de Administración, o "duenio". Sale del token, no de la URL:
+        el cliente no puede decir quién es."""
+        f = _sesion_valida(self._cookie("cacho_sesion")) or {}
+        return f.get("quien") or "duenio"
+
+    # LA PARED DE DATOS ES DE CÓDIGO (policía 11-set-2026). Una pestaña enjaulada de
+    # Administración tipea una ruta en su charla y la bandeja la lista y la sirve: el que lee
+    # es ESTE server (el usuario de la máquina, acceso total al disco), no el claude enjaulado, así
+    # que el DENY de la jaula no la frena. Con estas dos puertas, para quien no es el usuario una
+    # sesión es «suya» sólo si nació en la jaula, y un archivo sólo si vive adentro de ella.
+    def _sesion_suya(self, transcript):
+        if self._quien() == "duenio":
+            return True
+        if cacho_perfiles is None:
+            return False
+        try:
+            cwd = _leer_sesion(transcript).get("cwd") or "/"
+        except Exception as e:                       # noqa: BLE001 — pared: ante la duda, NO
+            print(f"⚠️ pared de la jaula: no pude leer {os.path.basename(transcript)} ({e!r}); "
+                  "se niega el acceso", file=sys.stderr)
+            return False
+        return os.path.realpath(cwd) == os.path.realpath(cacho_perfiles.TRABAJO)
+
+    def _archivo_de_la_jaula(self, ruta):
+        if cacho_perfiles is None:
+            return False
+        real = os.path.realpath(ruta)
+        for base in (cacho_perfiles.TRABAJO, os.path.expanduser("~/Library/Caches/Cacho/subidas")):
+            base = os.path.realpath(base)
+            if real == base or real.startswith(base + os.sep):
+                return True
+        return False
+
     def _pin_ok(self):
         """True si la request trae credencial de login válida por la URL: el PIN
         (?pin=) o un ticket de un solo uso (?t=, el que usa el lanzador). Cuenta
@@ -1784,8 +2119,10 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if not q.get("pin"):
             return False
-        if _pin_igual(q["pin"][0]):
+        perfil, quien = _quien_es(q["pin"][0])
+        if perfil:
             _acierto_pin(self._ip)
+            self._login = (perfil, quien)
             return True
         _fallo_pin(self._ip)
         return False
@@ -1897,7 +2234,8 @@ class Handler(BaseHTTPRequestHandler):
                 # Navegador: se le da el token y se REDIRIGE a la URL sin el ?pin=.
                 # Si no, el PIN queda a la vista en la barra, en el historial y en
                 # cualquier captura de pantalla que se saque de Cacho.
-                return self._redirigir_sin_pin(_sesion_nueva())
+                perfil, quien = getattr(self, "_login", ("duenio", ""))
+                return self._redirigir_sin_pin(_sesion_nueva(perfil, quien))
             # Script local (cacho_lanzar.py) con ?pin=: se le deja pasar ESTA
             # request y no se le abre sesión. Si se le diera token, cada llamada
             # dejaría uno nuevo y en tres lanzamientos echaría de la lista a los
@@ -1910,7 +2248,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "boot": BOOT_ID})
         elif ruta == "/api/estado":
             try:
-                self._json(estado_general())
+                self._json(estado_general(self._quien()))
             except Exception as e:
                 self._json({"error": repr(e)}, 500)
         elif ruta == "/api/uso":
@@ -1928,21 +2266,130 @@ class Handler(BaseHTTPRequestHandler):
             if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", sid):
                 return self._json({"error": "id inválido"}, 400)
             p = _buscar_transcript(sid)
-            if not p:
+            if not p or not self._sesion_suya(p):
                 return self._json({"error": "no encontré esa sesión"}, 404)
             try:
                 self._json(_leer_conversacion(p))
             except Exception as e:
                 self._json({"error": repr(e)}, 500)
+        elif ruta.startswith("/api/sesion/") and ruta.endswith("/archivos"):
+            # la bandeja: lo que pasó por la charla (ver cacho_bandeja.py)
+            sid = ruta.split("/")[3]
+            if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", sid):
+                return self._json({"error": "id inválido"}, 400)
+            if cacho_bandeja is None:
+                return self._json({"items": [], "sin_modulo": True})
+            p = _buscar_transcript(sid)
+            if not p or not self._sesion_suya(p):
+                return self._json({"error": "no encontré esa sesión"}, 404)
+            try:
+                items = cacho_bandeja.archivos(p)
+                if self._quien() != "duenio":
+                    items = [it for it in items if self._archivo_de_la_jaula(it["ruta"])]
+                self._json({"items": items})
+            except Exception as e:
+                print(f"⚠️ bandeja de {sid[:8]}: {e!r}", file=sys.stderr)
+                self._json({"error": repr(e)}, 500)
+        elif ruta == "/api/archivo":
+            q = parse_qs(urlparse(self.path).query)
+            self._archivo(q.get("sid", [""])[0], q.get("ruta", [""])[0],
+                          q.get("mini", [""])[0] == "1")
         elif ruta.startswith("/api/term/") and ruta.endswith("/stream"):
             self._stream(ruta.split("/")[3])
         else:
             self._json({"error": "no existe"}, 404)
 
+    def _archivo(self, sid, ruta, mini):
+        """Sirve UN archivo de la bandeja de la sesión `sid` (o su miniatura).
+
+        La única puerta es `cacho_bandeja.permitida()`: la ruta tiene que estar en la
+        lista de ESA charla. Sin eso, esto sería «leer cualquier archivo del disco con
+        PIN», y el PIN protege una app, no la máquina entera. Los .html salen en
+        `sandbox` por lo mismo que los de /static: un archivo que se mira no puede
+        correr con el origen de Cacho. Soporta `Range` porque sin eso Safari (iPhone)
+        no reproduce un video ni abre un PDF grande."""
+        if cacho_bandeja is None:
+            return self._json({"error": "sin bandeja en esta instalación"}, 404)
+        if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", sid or ""):
+            return self._json({"error": "id inválido"}, 400)
+        p = _buscar_transcript(sid)
+        real = cacho_bandeja.permitida(p, ruta) if p and self._sesion_suya(p) else None
+        if not real or (self._quien() != "duenio" and not self._archivo_de_la_jaula(real)):
+            return self._json({"error": "ese archivo no está en la bandeja de esta sesión"}, 404)
+        if mini:
+            m = cacho_bandeja.miniatura(real)
+            if not m:
+                return self._json({"error": "sin miniatura"}, 404)
+            real, ext = m, ".jpg"
+        else:
+            ext = os.path.splitext(real)[1].lower()
+        try:
+            st = os.stat(real)
+        except OSError:
+            return self._json({"error": "ya no está"}, 404)
+        etag = '"%x-%x"' % (int(st.st_mtime), st.st_size)
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        tipo = cacho_bandeja.MIME.get(ext, "application/octet-stream")
+        if tipo.startswith("text/"):
+            tipo += "; charset=utf-8"
+        inicio, fin = 0, st.st_size - 1
+        rango = self.headers.get("Range", "")
+        m = re.fullmatch(r"bytes=(\d*)-(\d*)", rango.strip()) if rango else None
+        if m and (m.group(1) or m.group(2)):
+            if m.group(1):
+                inicio = int(m.group(1))
+                if m.group(2):
+                    fin = min(int(m.group(2)), fin)
+            else:   # los últimos N bytes
+                inicio = max(0, st.st_size - int(m.group(2)))
+            if inicio > fin or inicio >= st.st_size:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{st.st_size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {inicio}-{fin}/{st.st_size}")
+        else:
+            self.send_response(200)
+        largo = fin - inicio + 1
+        self.send_header("Content-Type", tipo)
+        self.send_header("Content-Length", str(largo))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "private, no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        nombre = os.path.basename(real).encode("utf-8", "replace")
+        self.send_header("Content-Disposition",
+                         "inline; filename*=UTF-8''" + quote(nombre))
+        if ext in (".html", ".htm", ".svg"):
+            self.send_header("Content-Security-Policy",
+                             "sandbox; default-src 'none'; img-src data: 'self'; "
+                             "style-src 'unsafe-inline'; font-src data:")
+        self.end_headers()
+        try:
+            with open(real, "rb") as fh:
+                fh.seek(inicio)
+                while largo > 0:
+                    trozo = fh.read(min(256 * 1024, largo))
+                    if not trozo:
+                        break
+                    self.wfile.write(trozo)
+                    largo -= len(trozo)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+
     def _stream(self, tid):
         with TABS_LOCK:
             t = TABS.get(tid)
-        if not t:
+        if not t or t.duenio != self._quien():
+            # Mismo criterio que el POST: la pestaña de otro no existe. Leer el stream es ver
+            # la terminal ajena en vivo, así que este chequeo pesa igual que aquel.
             return self._json({"error": "no existe"}, 404)
         # "desde": cuántos bytes de esta pestaña ya tiene el navegador. Si todavía
         # los tenemos en el buffer, se le manda SOLO lo que se perdió y no borra lo
@@ -2139,12 +2586,15 @@ class Handler(BaseHTTPRequestHandler):
             if espera:
                 return self._bloqueo(espera)
             datos = parse_qs(self._body().decode("utf-8", "replace"))
-            if _pin_igual(datos.get("pin", [""])[0]):
+            perfil, quien = _quien_es(datos.get("pin", [""])[0])
+            if perfil:
                 _acierto_pin(self._ip)
+                if quien:
+                    _log_seguridad("entró %s (perfil %s)" % (quien, perfil))
                 self.send_response(303)
                 self.send_header("Location", "/")
-                self.send_header("Set-Cookie",
-                                 self._COOKIE_SESION.format(tok=_sesion_nueva()))
+                self.send_header("Set-Cookie", self._COOKIE_SESION.format(
+                    tok=_sesion_nueva(perfil, quien)))
                 self.send_header("Content-Length", "0")
                 self.end_headers()
             else:
@@ -2215,7 +2665,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not os.path.isdir(cwd):
                     return self._json(
                         {"error": "la carpeta de esa sesión ya no existe"}, 400)
-            else:
+            elif self._quien() == "duenio":
                 permitidos = {p["cwd"] for p in proyectos()}
                 if cwd not in permitidos:
                     return self._json({"error": "proyecto inválido"}, 400)
@@ -2263,7 +2713,14 @@ class Handler(BaseHTTPRequestHandler):
             area = q.get("area", [""])[0]
             if area and not areas.valida(area):
                 return self._json({"error": "área inválida"}, 400)
-            t = TermSession(cwd, resume_id=resume, modelo=modelo, area=area)
+            # La jaula la pone el SERVER según quién entró, no el cliente. Que el cwd y el
+            # área vengan por la URL está bien para el usuario; para Administración serían un
+            # pedido de la parte que justamente estamos encerrando.
+            quien = self._quien()
+            jaula = cacho_perfiles.jaula(quien) if (quien != "duenio" and cacho_perfiles) else None
+            if jaula:
+                cwd, area = jaula["cwd"], jaula["area"]
+            t = TermSession(cwd, resume_id=resume, modelo=modelo, area=area, jaula=jaula)
             if area and t.transcript_id:
                 _meta_set(t.transcript_id, {"area": area})
             with TABS_LOCK:
@@ -2276,6 +2733,10 @@ class Handler(BaseHTTPRequestHandler):
             with TABS_LOCK:
                 t = TABS.get(tid)
             if not t:
+                return self._json({"error": "no existe"}, 404)
+            # Una pestaña ajena no existe para vos: 404, no 403. Un 403 confirmaría que el id
+            # es bueno, y el id es lo único que hace falta para escribir en la terminal de otro.
+            if t.duenio != self._quien():
                 return self._json({"error": "no existe"}, 404)
             if accion == "input":
                 try:
@@ -2561,7 +3022,7 @@ body{
    (La caja no cambia de tamaño con el nombre: `flex:none` y ancho fijo, así "Waldemar"
    —el más largo— no le come el botón en los 300 px de la barra.) */
 #btn-nueva{
-  margin-left:auto; flex:none; width:26px; height:26px; border-radius:50%;
+  flex:none; width:26px; height:26px; border-radius:50%;
   display:flex; align-items:center; justify-content:center;
   background:var(--card); color:var(--ar-col, var(--acento));
   border:1px solid var(--borde); font-size:14px; line-height:1; cursor:pointer;
@@ -2570,6 +3031,37 @@ body{
 #btn-nueva:hover{
   background:var(--ar-col, var(--acento)); color:#fff; border-color:transparent;
 }
+/* El 🔔 de al lado del ＋ (10-set-2026, pedido del usuario). Con 17 charlas abiertas, «¿qué
+   tengo para contestar?» se leía punto por punto: el ocre de cada ítem dice "quieta" pero
+   hay que recorrer la barra entera, y el (11) del título de la pestaña dice CUÁNTAS pero
+   no CUÁLES. Este botón filtra la lista a las que ya terminaron su trabajo y están
+   quietas esperando respuesta — ni las que están trabajando, ni las terminadas de hoy.
+   Habla el mismo idioma que la campanita del ítem (terminó y te espera) y adentro del
+   filtro las avisadas —las que terminaron desde la última vez que las miraste— van
+   arriba. El número vive en el botón porque es la misma pregunta: cuántas y cuáles.
+   Lleva el margin-left:auto que antes tenía el ＋: es el primero de los dos. */
+#btn-espera{
+  margin-left:auto; flex:none; position:relative;
+  width:26px; height:26px; border-radius:50%;
+  display:flex; align-items:center; justify-content:center;
+  background:var(--card); color:var(--ar-col, var(--acento));
+  border:1px solid var(--borde); font-size:12px; line-height:1; cursor:pointer;
+  font-family:inherit; padding:0;
+}
+#btn-espera:hover{border-color:var(--ar-col, var(--acento))}
+#btn-espera.on{
+  background:var(--ar-col, var(--acento)); border-color:transparent;
+}
+/* Prendido, el badge ocre sobre el terracota del área no se leía: se da vuelta. */
+#btn-espera.on b{background:#fff; color:var(--ar-col, var(--acento))}
+#btn-espera.vacio{opacity:.4}
+#btn-espera b{
+  position:absolute; top:-4px; right:-4px; min-width:14px; height:14px;
+  border-radius:7px; padding:0 3px; box-sizing:border-box;
+  background:var(--ocre); color:#fff; font-size:9.5px; font-weight:700;
+  line-height:14px; text-align:center; font-family:var(--display, inherit);
+}
+#btn-espera.vacio b{display:none}
 /* Buscador de la barra (21-ago-2026). El ⌘K sigue estando —abre cualquier cosa
    desde el teclado, incluso una sesión nueva—, pero se acuerda quien lo sabe.
    Este está a la vista y hace otra cosa: filtra la lista SIN taparla, así que
@@ -2894,6 +3386,66 @@ body.area-fija .item .cara-ar{display:none}
 #mic-live.ver{display:block}
 #mic-live .int{color:var(--gris); font-style:italic}
 @media (max-width:700px){ #btn-mic, #btn-enviar-esc, #mic-live{display:none !important} }
+/* ---------- la BANDEJA de archivos de la sesión (11-set-2026) ----------
+   Una tira al pie con todo lo que pasó por la charla (lo que subiste y lo que
+   Claude produjo o mostró). Aparece sola cuando hay algo; tocar → se abre grande. */
+#bandeja{
+  display:none; flex:none; align-items:center; gap:8px; padding:7px 14px 8px;
+  border-top:1px solid var(--borde); background:var(--panel); overflow-x:auto;
+  overscroll-behavior-x:contain; -webkit-overflow-scrolling:touch;
+}
+#bandeja.ver{display:flex}
+#bandeja .bl{flex:none; font-size:11px; color:var(--gris); writing-mode:vertical-rl;
+  transform:rotate(180deg); letter-spacing:.06em; text-transform:uppercase; height:62px;
+  display:flex; align-items:center}
+.arch{
+  flex:none; width:62px; height:62px; border-radius:11px; position:relative; cursor:pointer;
+  background:var(--card); border:1.5px solid var(--borde); overflow:hidden;
+  display:flex; align-items:center; justify-content:center; font-size:26px;
+  transition:transform .12s ease-out;
+}
+.arch:hover{transform:translateY(-2px)}
+.arch img{width:100%; height:100%; object-fit:cover; display:block}
+.arch.vos{border-color:var(--acento)}
+.arch .qn{
+  position:absolute; left:0; right:0; bottom:0; font-size:9px; line-height:14px;
+  text-align:center; color:#fff; background:rgba(31,30,27,.62); letter-spacing:.03em;
+}
+.arch.vos .qn{background:rgba(201,100,66,.85)}
+.arch .ext{font-size:10px; font-weight:600; color:var(--gris); position:absolute; top:5px; right:6px;
+  font-family:var(--display)}
+/* el visor grande: velo + tarjeta; cabecera con nombre · quién · hora · nota */
+#visor-arch{display:none; position:fixed; inset:0; z-index:60; background:rgba(31,30,27,.78);
+  align-items:center; justify-content:center; padding:18px}
+#visor-arch.ver{display:flex}
+#visor-arch .va{
+  background:var(--card); border-radius:16px; width:min(1100px,100%); height:min(92vh,100%);
+  display:flex; flex-direction:column; overflow:hidden; box-shadow:0 20px 60px rgba(0,0,0,.4);
+}
+#visor-arch .vah{flex:none; display:flex; align-items:center; gap:10px; padding:10px 14px;
+  border-bottom:1px solid var(--borde); background:var(--panel); min-width:0}
+#visor-arch .vah .nom{flex:1; min-width:0; font-family:var(--display); font-size:14px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+#visor-arch .vah .nom small{display:block; font-family:inherit; font-size:11px; color:var(--gris);
+  white-space:normal}
+#visor-arch .vah button{border:1px solid var(--borde); background:var(--card); color:var(--tinta);
+  border-radius:9px; padding:6px 10px; font-size:13px; cursor:pointer; flex:none}
+#visor-arch .vah button.x{font-size:16px; line-height:1; padding:5px 9px}
+#visor-arch .vac{flex:1; min-height:0; display:flex; align-items:center; justify-content:center;
+  background:#1E1D1B; position:relative}
+#visor-arch .vac img{max-width:100%; max-height:100%; object-fit:contain}
+#visor-arch .vac iframe{width:100%; height:100%; border:0; background:#fff}
+#visor-arch .vac video{max-width:100%; max-height:100%}
+#visor-arch .vac pre{width:100%; height:100%; margin:0; padding:16px 20px; overflow:auto;
+  background:var(--card); color:var(--tinta); font-size:13px; white-space:pre-wrap}
+#visor-arch .vac .nada{color:#E8E6DC; text-align:center; font-size:15px; padding:30px}
+#visor-arch .vac .nada b{display:block; font-size:54px; margin-bottom:12px}
+@media (max-width:700px){
+  #visor-arch{padding:0}
+  #visor-arch .va{border-radius:0; width:100%; height:100%}
+  #visor-arch .vah button span{display:none}
+  #bandeja .bl{display:none}   /* en el teléfono cada píxel de ancho es una miniatura */
+}
 /* ---------- SOLO TELÉFONO (≤700px): el escritorio no entra acá ----------
    Estética tipo app de Claude en iOS: barra superior con ☰, la lista de
    sesiones es un cajón que se desliza desde la izquierda con velo detrás. */
@@ -2939,6 +3491,7 @@ body.area-fija .item .cara-ar{display:none}
   .item{padding:11px 10px}
   .item .tit{font-size:14px}
   #btn-nueva{width:32px; height:32px; font-size:17px}   /* el dedo, no el mouse */
+  #btn-espera{width:32px; height:32px; font-size:15px}
   #terms{padding:8px}
   .term-box{inset:8px; border-radius:10px; padding:8px 10px}
   #vacio{font-size:15px; padding:0 24px; text-align:center}
@@ -3026,6 +3579,8 @@ body.area-fija .item .cara-ar{display:none}
 <div id="side">
   <h1><img class="logo-foto" id="cara-area" src="/static/cacho.png" alt="">
       <span id="tit-area" title="">Cacho</span>
+      <button id="btn-espera" title="Ver sólo las que terminaron y te esperan"
+              aria-label="Ver sólo las que terminaron y te esperan">🔔<b></b></button>
       <button id="btn-nueva" title="Nueva sesión con Cacho"
               aria-label="Nueva sesión con Cacho">＋</button></h1>
   <div id="filtro-caja">
@@ -3054,6 +3609,7 @@ body.area-fija .item .cara-ar{display:none}
     <button id="btn-enviar-esc" title="Enviar (Enter en la sesión activa)"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg></button>
     <div id="mic-live"></div>
   </div>
+  <div id="bandeja"><span class="bl">archivos</span></div>
   <div id="input-m">
     <div id="teclas-m">
       <button id="btn-modo" data-seq="&#27;[Z"
@@ -3075,6 +3631,17 @@ body.area-fija .item .cara-ar{display:none}
       <button id="btn-mic-m" title="Dictar por micrófono"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg></button>
       <button id="btn-enviar" title="Enviar">➤</button>
     </div>
+  </div>
+</div>
+<div id="visor-arch">
+  <div class="va">
+    <div class="vah">
+      <div class="nom"><span id="va-nom"></span><small id="va-sub"></small></div>
+      <button id="va-ruta" title="Pegar la ruta en la sesión activa">📎 <span>Ruta a la sesión</span></button>
+      <button id="va-abrir" title="Abrir en otra pestaña del navegador">↗ <span>Abrir</span></button>
+      <button class="x" id="va-x" title="Cerrar (esc)">✕</button>
+    </div>
+    <div class="vac" id="va-cuerpo"></div>
   </div>
 </div>
 <script>
@@ -3107,6 +3674,9 @@ let terminadasAbiertas = false;
 // script — si el navegador lo tiene bloqueado, un throw acá deja a Cacho sin JS.
 try{ terminadasAbiertas = localStorage.getItem("cacho_terminadas") === "1"; }catch(_){}
 let filtroTxt = "";       // lo escrito en el buscador de la barra
+/* El filtro del 🔔: mostrar SÓLO lo que terminó y espera respuesta. No se recuerda
+   entre recargas, por lo mismo que el área: Cacho tiene que abrir mostrando todo. */
+let soloEspera = false;
 /* ─── ÁREAS (23-ago-2026) ───────────────────────────────────────────────────────────
    `areaActiva` null = ver TODO, que es como arranca siempre. Eso no es un detalle: la
    investigación decía que un cajón que esconde cosas se abandona, así que el estado por
@@ -3312,6 +3882,8 @@ function activar(id){
   document.querySelectorAll(".term-box, .ver-box").forEach(b =>
     b.classList.toggle("ver", b.dataset.id === id));
   $("#vacio").style.display = id ? "none" : "flex";
+  bandejaFirma = "";           // otra sesión: la tira se repinta sí o sí
+  pintarBandeja();
   const a = abiertas[id];
   if(a){
     requestAnimationFrame(() => {
@@ -3621,7 +4193,11 @@ function pintarMarcoArea(){
   if(h1 && ai) h1.style.setProperty("--ar-col", ai.color);
   if(bn){
     const con = "Nueva sesión con " + (ai ? ai.nombre : "Cacho");
-    bn.dataset.nuevaEn = ai ? ai.clave : "";   // NO `data-area`: ése es de la tira
+    // Sin cara elegida el botón dice «con Cacho», y hasta el 11-set-2026 mandaba área
+    // vacía: la pestaña nacía PELADA (sin el arranque de Cacho, sin MEMORY-cacho.md) y la
+    // tira la mostraba como Cacho igual — decía una cosa y hacía otra. Cacho es el área
+    // por defecto en todos lados; también al nacer.
+    bn.dataset.nuevaEn = ai ? ai.clave : (estado.area_defecto || "");   // NO `data-area`: ése es de la tira
     bn.title = con;
     bn.setAttribute("aria-label", con);
   }
@@ -3643,6 +4219,30 @@ function ponerCara(sel, cara){
   if(img.getAttribute("src") !== src) img.setAttribute("src", src);
 }
 
+/* El botón 🔔: cuántas terminaron y te esperan. Cuenta lo mismo que va a mostrar —
+   respeta el área elegida en la tira, no el buscador— así que el número nunca puede
+   discrepar con la lista que aparece al tocarlo. Las automáticas no cuentan (no esperan
+   nada de nadie) y las terminadas tampoco (ya no esperan). En cero queda tenue y sin
+   número: sigue estando, pero no grita.
+   `te_espera` lo decide el server leyendo el transcript (11-set-2026): «quieta» no es
+   «te espera» — una pestaña nueva sin nada escrito está quieta y no espera nada. */
+function pintarBotonEspera(){
+  const b = $("#btn-espera");
+  if(!b) return;
+  const vivas = estado.tabs.map(t => Object.assign({__tab:true}, t))
+      .concat((estado.afuera || []).filter(s => s.viva && s.tipo === "terminal"));
+  const n = vivas.filter(o => o.te_espera
+                          && (!areaActiva || areaDe(o) === areaActiva)).length;
+  b.classList.toggle("on", soloEspera);
+  b.classList.toggle("vacio", n === 0);
+  const bb = b.querySelector("b");
+  if(bb && bb.textContent !== String(n)) bb.textContent = String(n);
+  const tit = soloEspera ? "Ver todas de nuevo"
+    : n ? n + (n === 1 ? " terminó y te espera" : " terminaron y te esperan")
+        : "Nada esperándote ahora";
+  if(b.title !== tit){ b.title = tit; b.setAttribute("aria-label", tit); }
+}
+
 function render(){
   // barra lateral. Con el buscador escrito, TODAS las secciones quedan filtradas
   // (las fijadas incluidas: si buscás algo, buscás en todo) y se muestran más
@@ -3651,8 +4251,12 @@ function render(){
   const casaCon = buscador(q);
   // El área filtra ANTES que el buscador. Con un área elegida, buscar busca adentro de esa
   // área — que es lo que espera cualquiera que acaba de decir «estoy en publicidad».
+  // Con el 🔔 prendido queda sólo lo que TERMINÓ SU TRABAJO y está quieto esperando que
+  // el usuario conteste: lo que está trabajando todavía no espera nada, y lo terminado ya no
+  // espera nunca más (esas caen solas: su estado es "terminada").
   const filtrar = a => {
     let r = areaActiva ? a.filter(o => areaDe(o) === areaActiva) : a;
+    if(soloEspera) r = r.filter(o => o.te_espera);
     return q ? r.filter(o => casaCon(textoDe(o))) : r;
   };
   const tabs = filtrar(estado.tabs.map(t => Object.assign({__tab:true}, t)));
@@ -3677,6 +4281,10 @@ function render(){
   const libres = a => a.filter(o => !fijos.has(o.sid));
 
   const tabsL = libres(tabs);
+  // Adentro del filtro, arriba las que terminaron DESDE QUE LAS MIRASTE (las del 🔔 del
+  // ítem). El sort de JS es estable, así que el resto conserva el orden del server.
+  if(soloEspera) tabsL.sort((a, b) =>
+    (esperan.has(claveDe(a)) ? 0 : 1) - (esperan.has(claveDe(b)) ? 0 : 1));
   if(tabsL.length){
     h += '<div class="seccion">En esta app</div>' +
       tabsL.map(t => itemHTML(t, attrsDe(t), {activo:esActiva(t), botonX:botonX(t)})).join("");
@@ -3686,12 +4294,15 @@ function render(){
     h += '<div class="seccion">En Terminal (afuera)</div>' +
       termL.map(s => itemHTML(s, attrsDe(s), {})).join("");
   }
-  const autosL = libres(autos);
+  // Las automáticas corren solas y no esperan que nadie les conteste (mismo motivo por el
+  // que no avisan al terminar, ver revisarAvisos): adentro del filtro no van.
+  const autosL = soloEspera ? [] : libres(autos);
   if(autosL.length){
     h += '<div class="seccion">Automáticas</div>' +
       autosL.map(s => itemHTML(s, attrsDe(s), {activo:esActiva(s)})).join("");
   }
-  const terminadas = libres(filtrar(estado.afuera.filter(s => !s.viva)));
+  const terminadas = soloEspera ? []
+                  : libres(filtrar(estado.afuera.filter(s => !s.viva)));
   const term12 = terminadas.slice(0, q ? 40 : 12);
   if(term12.length){
     // Plegadas salvo que estés buscando o que la sesión abierta sea una de ellas.
@@ -3710,6 +4321,11 @@ function render(){
         (areaActiva ? ' en ' + esc((areaInfo(areaActiva)||{}).nombre || "") : "") + '.<br>' +
         'Se busca en el título, el tema, lo que se está tocando y lo que pediste.</div>';
   }
+  if(!h && soloEspera){
+    h = '<div class="nada-con-eso">Nada esperándote' +
+        (areaActiva ? ' en ' + esc((areaInfo(areaActiva)||{}).nombre || "") : "") +
+        '.<br>Tocá el 🔔 de arriba para ver todo.</div>';
+  }
   if(!h && areaActiva && !q){
     const ai = areaInfo(areaActiva) || {};
     h = '<div class="nada-con-eso">Nada en ' + esc(ai.nombre || "") + ' ahora mismo.<br>' +
@@ -3726,8 +4342,11 @@ function render(){
   const cuantas = tabs.length + vivasAfuera.length + term12.length;
   $("#pie").textContent = q
     ? cuantas + (cuantas === 1 ? " charla" : " charlas") + " con «" + q + "» · esc para limpiar"
+    : soloEspera
+    ? cuantas + (cuantas === 1 ? " terminó y te espera" : " terminaron y te esperan")
     : estado.tabs.length + " en la app · " + vivasAfuera.length + " afuera · " +
       muertas + " terminadas hoy" + (MOVIL ? "" : " · ⌘K buscar");
+  pintarBotonEspera();
   if(MOVIL){
     const t = estado.tabs.find(t => t.id === activa);
     $("#tit-m").textContent = t ? ((t.icono ? t.icono + " " : "") + t.titulo) :
@@ -3897,18 +4516,31 @@ document.addEventListener("click", e => {
     }
     if(item.dataset.ver){ abrirVer(item.dataset.ver, item.dataset.vtit, item.dataset.viva === "1"); return; }
   }
+  // El 🔔 de arriba: prende y apaga el filtro de "terminó y te espera". blur() por lo
+  // mismo que el ＋: pegado al buscador, con el foco puesto cualquier Enter lo redispara.
+  const be = e.target.closest("#btn-espera");
+  if(be){
+    be.blur();
+    soloEspera = !soloEspera;
+    document.body.classList.toggle("solo-espera", soloEspera);
+    render();
+    return;
+  }
   const bg = e.target.closest("#btn-nueva");
   if(bg){
-    // Nueva sesión CON QUIEN ESTÁS PARADO. El proyecto sigue siendo el primero —
-    // siempre lo fue—; lo que se agrega es el área, que hasta hoy había que esperar
-    // que la máquina adivinara del texto. Sin nadie elegido en la tira sale igual que
-    // antes: sesión pelada que clasifica sola.
+    // Nueva sesión CON QUIEN ESTÁS PARADO. El proyecto es el primero de la lista,
+    // salvo que el área declare el suyo (`proyecto` en areas.py). Sin nadie elegido
+    // en la tira sale igual que antes:
+    // sesión pelada que clasifica sola.
     // blur() a propósito: es el único botón que crea una sesión de UN click, está
     // pegado arriba del buscador, y si se queda con el foco cualquier Enter o barra
     // espaciadora posterior lo vuelve a disparar sin que nadie lo haya tocado.
     bg.blur();
-    const p = estado.proyectos[0];
-    if(p) nueva(p.cwd, bg.dataset.nuevaEn || "");
+    const ar = areaInfo(bg.dataset.nuevaEn || "");
+    const quiero = (ar && ar.proyecto) || (estado.proyectos[0] || {}).nombre || "";
+    const p = estado.proyectos.find(p => p.nombre.includes(quiero));
+    if(!p){ aviso("No encuentro la carpeta «" + quiero + "» en ~/Claude/Projects"); return; }
+    nueva(p.cwd, bg.dataset.nuevaEn || "");
     return;
   }
 });
@@ -4430,7 +5062,7 @@ function revisarAvisos(){
     vistos[k] = o.estado;
     if(o.estado === "trabajando"){
       esperan.delete(k);   // arrancó de nuevo (le contestaste por otro lado)
-    } else if(estadoPrev[k] === "trabajando" && o.estado === "esperando"){
+    } else if(estadoPrev[k] === "trabajando" && o.te_espera){
       // si la estás mirando de frente no hace falta molestar
       const mirando = document.hasFocus() && o.__tab && activa === o.id;
       if(!mirando){ esperan.add(k); notificar(o); }
@@ -4574,6 +5206,129 @@ $("#paleta").addEventListener("click", e => {
   if(e.target.id === "paleta") cerrarPaleta();   // click en el velo
 });
 // El atajo va en captura: xterm se come el keydown si el foco está en la terminal.
+/* ---------- la BANDEJA de archivos (11-set-2026) ----------
+   Lo que pasó por la charla activa, según SU transcript (/api/sesion/<sid>/archivos):
+   lo que subiste y lo que Claude produjo o mostró. Se repinta con el refresco de 4 s
+   y al cambiar de sesión; si la lista no cambió no se toca el DOM (la tira scrollea). */
+const ICONO_ARCH = {pdf:"📄", html:"🌐", texto:"📝", doc:"📊", video:"🎬", audio:"🎧", imagen:"🖼"};
+let bandejaFirma = "", bandejaItems = [], bandejaSid = "";
+function sidActiva(){
+  if(!activa) return "";
+  if(activa.startsWith("ver:")) return activa.slice(4);
+  const t = estado.tabs.find(x => x.id === activa);
+  return (t && t.sid) || "";
+}
+function urlArch(it, mini){
+  return "/api/archivo?sid=" + encodeURIComponent(bandejaSid) +
+         "&ruta=" + encodeURIComponent(it.ruta) + (mini ? "&mini=1" : "") +
+         "&v=" + it.mtime;   // el mtime en la URL: si el archivo cambia, la miniatura también
+}
+function mostrarBandeja(ver){
+  const b = $("#bandeja");
+  if(b.classList.contains("ver") === ver) return;
+  b.classList.toggle("ver", ver);
+  // la tira le saca alto a la terminal: xterm tiene que volver a medir
+  const a = abiertas[activa];
+  if(a) requestAnimationFrame(() => { a.fit.fit(); ubicarBotones(); });
+}
+async function pintarBandeja(){
+  const sid = sidActiva();
+  if(!sid){ bandejaSid = ""; bandejaFirma = ""; mostrarBandeja(false); return; }
+  try{
+    const r = await fetch(`/api/sesion/${sid}/archivos`);
+    const j = await r.json();
+    if(j.error) throw new Error(j.error);
+    if(sid !== sidActiva()) return;   // cambiaste de sesión mientras cargaba
+    const items = j.items || [];
+    const firma = sid + "|" + items.map(i => i.ruta + "@" + i.mtime).join("|");
+    if(firma === bandejaFirma) return;
+    const nuevos = bandejaSid === sid && items.length > bandejaItems.length;
+    bandejaFirma = firma; bandejaItems = items; bandejaSid = sid;
+    const b = $("#bandeja");
+    b.querySelectorAll(".arch").forEach(e => e.remove());
+    items.forEach((it, i) => {
+      const d = document.createElement("div");
+      d.className = "arch " + it.quien; d.dataset.i = i;
+      d.title = it.nombre + " · " + (it.quien === "vos" ? "lo subiste vos" : "de Claude") +
+                (it.hora ? " · " + it.hora : "") + (it.nota ? "\n" + it.nota : "");
+      const conMini = !["audio", "texto"].includes(it.tipo);
+      d.innerHTML = (conMini
+          ? `<img loading="lazy" alt="" src="${urlArch(it, true)}"
+                  onerror="this.replaceWith(Object.assign(document.createElement('span'),{textContent:'${ICONO_ARCH[it.tipo] || "📎"}'}))">`
+          : `<span>${ICONO_ARCH[it.tipo] || "📎"}</span>`) +
+        `<span class="ext">${esc(it.ext.slice(1).toUpperCase())}</span>` +
+        `<span class="qn">${it.quien === "vos" ? "vos" : "Claude"}</span>`;
+      d.addEventListener("click", () => abrirArchivo(i));
+      b.appendChild(d);
+    });
+    mostrarBandeja(items.length > 0);
+    if(nuevos || !b.dataset.pos) requestAnimationFrame(() => { b.scrollLeft = b.scrollWidth; b.dataset.pos = "1"; });
+  }catch(err){
+    // sin bandeja no se cae nada: la sesión sigue igual
+    console.warn("bandeja:", err.message);
+  }
+}
+let archAbierto = null;
+function abrirArchivo(i){
+  const it = bandejaItems[i];
+  if(!it) return;
+  archAbierto = it;
+  const url = urlArch(it, false);
+  $("#va-nom").textContent = it.nombre;
+  $("#va-sub").textContent = (it.quien === "vos" ? "lo subiste vos" : "de Claude") +
+      (it.hora ? " · " + it.hora : "") + " · " + tamanio(it.bytes) + (it.nota ? " · " + it.nota : "");
+  const c = $("#va-cuerpo");
+  c.innerHTML = "";
+  if(it.tipo === "imagen" && it.ext !== ".heic"){
+    c.innerHTML = `<img src="${url}" alt="">`;
+  } else if(it.tipo === "pdf" || it.tipo === "html"){
+    // sandbox SOLO al .html: un archivo que se mira no corre con el origen de Cacho (el
+    // server ya lo manda con CSP sandbox; acá se repite por si un navegador lo ignora).
+    // Al PDF no: el visor de PDF de Chrome adentro de un iframe sandboxeado queda en blanco.
+    // En iPhone el iframe muestra la primera página nomás: para el resto está ↗ Abrir.
+    const f = document.createElement("iframe");
+    f.src = url; if(it.tipo === "html") f.setAttribute("sandbox", ""); c.appendChild(f);
+  } else if(it.tipo === "video"){
+    c.innerHTML = `<video controls playsinline autoplay src="${url}"></video>`;
+  } else if(it.tipo === "audio"){
+    c.innerHTML = `<div class="nada"><b>🎧</b>${esc(it.nombre)}<br><br><audio controls autoplay src="${url}"></audio></div>`;
+  } else if(it.tipo === "texto"){
+    c.innerHTML = `<pre>cargando…</pre>`;
+    fetch(url).then(r => r.text()).then(t => { if(archAbierto === it) c.querySelector("pre").textContent = t; })
+      .catch(err => { c.querySelector("pre").textContent = "No pude leerlo: " + err.message; });
+  } else {
+    // Excel, Word, HEIC…: el navegador no lo dibuja adentro; ↗ lo abre o lo baja
+    c.innerHTML = `<div class="nada"><b>${ICONO_ARCH[it.tipo] || "📎"}</b>${esc(it.nombre)}<br>
+      <small>Este tipo no se ve acá adentro: tocá <b style="display:inline;font-size:inherit">↗ Abrir</b> y lo abre el navegador (o lo baja).</small></div>`;
+  }
+  $("#va-ruta").style.display = (activa && abiertas[activa]) ? "" : "none";
+  $("#visor-arch").classList.add("ver");
+}
+function cerrarArchivo(){
+  $("#visor-arch").classList.remove("ver");
+  $("#va-cuerpo").innerHTML = "";   // corta el video/audio que estuviera sonando
+  archAbierto = null;
+}
+function tamanio(b){
+  if(b < 1024) return b + " b";
+  if(b < 1024 * 1024) return (b / 1024).toFixed(0) + " KB";
+  return (b / 1048576).toFixed(1).replace(".", ",") + " MB";
+}
+$("#va-x").addEventListener("click", cerrarArchivo);
+$("#visor-arch").addEventListener("click", e => { if(e.target === $("#visor-arch")) cerrarArchivo(); });
+$("#va-abrir").addEventListener("click", () => { if(archAbierto) window.open(urlArch(archAbierto, false), "_blank"); });
+$("#va-ruta").addEventListener("click", () => {
+  if(!archAbierto || !activa || !abiertas[activa]) return;
+  mandar("\x1b[200~\"" + archAbierto.ruta + "\" \x1b[201~");
+  cerrarArchivo(); enfocarSesion();
+  aviso("La ruta quedó en la sesión — agregá texto si querés y mandá ⏎");
+});
+document.addEventListener("keydown", e => {
+  if(e.key === "Escape" && $("#visor-arch").classList.contains("ver")){
+    e.preventDefault(); e.stopPropagation(); cerrarArchivo();
+  }
+}, true);
+
 document.addEventListener("keydown", e => {
   if((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")){
     e.preventDefault(); e.stopPropagation();
@@ -4650,11 +5405,12 @@ async function pintarUso(){
   // arranque: si no hay ninguna pestaña viva, abrir una en el proyecto principal
   if(!estado.tabs.some(t => t.viva)){
     const pref = estado.proyectos[0];
-    if(pref) await nueva(pref.cwd);
+    // con área declarada (Cacho): la pestaña del arranque no nace pelada
+    if(pref) await nueva(pref.cwd, estado.area_defecto || "");
   } else {
     abrirTab(estado.tabs.filter(t => t.viva).slice(-1)[0].id);
   }
-  setInterval(() => { refrescar(); pintarVer(); }, 4000);
+  setInterval(() => { refrescar(); pintarVer(); pintarBandeja(); }, 4000);
   pintarUso();
   setInterval(pintarUso, 5 * 60 * 1000);
 })();
@@ -4690,10 +5446,20 @@ if __name__ == "__main__":
     # se pregunta acá y no en la primera pestaña, para que abrir una no espere al
     # `claude --help` (y para que el aviso de CLI viejo salga al arrancar, no después)
     threading.Thread(target=_soporta_session_id, daemon=True).start()
+    # El SIGTERM de launchd (`kickstart -k`, el reinicio) mataba el proceso EN SECO: el
+    # `finally` de abajo nunca corría y las pestañas morían con el pty, sin que nadie las
+    # anotara. Ahora el SIGTERM pide un cierre ordenado (shutdown() tiene que llamarse desde
+    # OTRO hilo que serve_forever, si no se traba) y el cierre las anota antes de matarlas.
+    signal.signal(signal.SIGTERM,
+                  lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
+    _restaurar_pestanas()
     print(f"Cacho en http://{BIND}:{PORT}  (Ctrl-C para cortar)")
     try:
         server.serve_forever()
     finally:
+        # PRIMERO anotar, DESPUÉS matar: matar espera hasta 1 s por pestaña y launchd
+        # manda SIGKILL a los 20 s — si hubiera 30 pestañas, la anotación tiene que estar.
+        _guardar_pestanas_vivas()
         with TABS_LOCK:
             for t in TABS.values():
                 t.matar()

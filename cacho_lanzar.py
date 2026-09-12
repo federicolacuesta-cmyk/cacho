@@ -161,7 +161,7 @@ def crear_pestana(modelo="", area=""):
     `modelo`: pedido explícito para esta pestaña (p. ej. una cita premium que exige
     Fable). Vacío = el default de la casa (~/.cacho_modelo, hoy Opus).
 
-    `area`: de quién es esta corrida (`areas.py`: cacho/carla/jaime/eterna/waldemar/xara).
+    `area`: de quién es esta corrida (`areas.py`: cacho/carla/jaime/eterna/waldemar/xara/ferguson).
     Vale la pena declararla SIEMPRE que el que llama lo sepa, y acá lo sabe casi siempre:
     la rutina de novedades de Google es de Jaime y el vigía de chats es de Carla, no hay
     nada que deducir. Sin esto, Cacho le adivinaba el área contando palabras del prompt
