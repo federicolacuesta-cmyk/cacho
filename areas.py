@@ -60,7 +60,7 @@ AREAS = [
     },
     {
         "clave": "carla", "nombre": "Carla", "rol": "Secretaria del usuario",
-        "gente": "quien le escribe a el usuario", "color": "#C2418C", "cara": "carla.png",
+        "gente": "quien le escribe a el usuario", "color": "#FF1FA6", "cara": "carla.png",
         # CORREGIDO 3-set-2026 (el usuario): Carla NO atiende clientes — eso es el call center (092/096).
         # Carla es la interlocutora del usuario con el mundo por SU WhatsApp (099): proveedores,
         # encargados, vendedores, colaboradores. «La secretaria de Cacho»: Cacho hace, Carla
@@ -80,7 +80,7 @@ AREAS = [
     },
     {
         "clave": "eterna", "nombre": "Eterna", "rol": "Operaciones",
-        "gente": "los locales", "color": "#2E8B57", "cara": "eterna.png",
+        "gente": "los locales", "color": "#00B8D4", "cara": "eterna.png",
         # OJO: «local» a secas NO va. Es palabra comodín (aparece en «servidor local»,
         # «archivo local») y ensucia la clasificación: las palabras muy comunes hacen
         # que el área aparezca donde no va.
@@ -91,7 +91,7 @@ AREAS = [
     },
     {
         "clave": "waldemar", "nombre": "Waldemar", "rol": "Producto",
-        "gente": "la mercadería", "color": "#7A5AF8", "cara": "waldemar.png",
+        "gente": "la mercadería", "color": "#9D1DFF", "cara": "waldemar.png",
         # No se pisa con Eterna ni con Xara aunque compartan vocabulario: «stock» a
         # secas sigue siendo del mostrador (Eterna) y «proveedor» del que hay que
         # pagarle (Xara). Lo de Waldemar es el VERBO DE COMPRA.
@@ -104,7 +104,7 @@ AREAS = [
     },
     {
         "clave": "xara", "nombre": "Xara", "rol": "Administración",
-        "gente": "proveedores y bancos", "color": "#B8860B", "cara": "xara.png",
+        "gente": "proveedores y bancos", "color": "#E6A800", "cara": "xara.png",
         "propias": ["xara", "bancari", "contab", "cobranza", "flujo de caja",
                     "estado de cuenta", "proveedor"],
         "palabras": ["banco", "factura", "iva", "saldo", "balance", "boleta", "cheque",
@@ -112,7 +112,7 @@ AREAS = [
     },
     {
         "clave": "ferguson", "nombre": "Ferguson", "rol": "Obras",
-        "gente": "la obra del local nuevo", "color": "#D97706", "cara": "ferguson.png",
+        "gente": "la obra del local nuevo", "color": "#E5173F", "cara": "ferguson.png",
         # Sólo obra, nada comercial: «proveedor» y «factura» a secas son de Xara (hay que
         # pagarle) y «local» de Eterna (ya abrió). Lo de Ferguson es el léxico de la OBRA.
         "propias": ["ferguson", "obra", "arquitecta", "arquitecto", "constructor",

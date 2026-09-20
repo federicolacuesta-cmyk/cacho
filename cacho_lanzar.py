@@ -22,9 +22,12 @@ PIN por token UNA vez y queda guardado en ~/.cacho_token (0600): un solo lugar d
 dispositivos que Cacho recuerda.
 
 Uso:
-  python3 cacho_lanzar.py "<prompt para la sesión>" [area]    # proyecto = dir actual
-Salida: exit 0 si la pestaña quedó creada con el prompt tipeado; exit != 0 si no se pudo
-(el caller decide el fallback, p. ej. una ventana de Terminal común).
+  python3 cacho_lanzar.py "<prompt para la sesión>" <area>          # el área es obligatoria
+  python3 cacho_lanzar.py --conector Notion "<prompt>" <area>       # un conector MCP extra
+Salida: exit 0 si la pestaña quedó creada Y EL CLI TOMÓ EL PROMPT (se verifica donde el CLI
+lo registra — el transcript de claude o ~/.codex/history.jsonl de Codex; «lo escribí en el
+pty» no alcanza); exit != 0 si no se pudo (el caller decide el fallback, p. ej. una ventana
+de Terminal común).
 """
 from __future__ import annotations
 import base64
@@ -37,6 +40,8 @@ import urllib.request
 import urllib.error
 from urllib.parse import quote, urlencode
 
+# El puerto se puede correr (CACHO_PORT, el mismo que lee el server): así una prueba habla
+# con un server de prueba y no con el de producción.
 PUERTO = os.environ.get("CACHO_PORT", "8811")
 BASE = "http://127.0.0.1:" + PUERTO
 AQUI = os.path.dirname(os.path.abspath(__file__))
@@ -45,6 +50,12 @@ PIN_PATH = os.path.expanduser("~/.cacho_pin")
 TOKEN_PATH = os.path.expanduser("~/.cacho_token")
 LOG = os.path.expanduser("~/Library/Logs/cacho-server.log")
 ESPERA_CLAUDE_S = 30  # el tab tipea `claude` solo a los ~0.9s; esto cubre el arranque del CLI
+# Dónde registra cada CLI lo que el usuario le mandó: es la única evidencia de que el prompt
+# ENTRÓ (un pty acepta cualquier byte, también los que se come un diálogo).
+PROJECTS_DIR = os.path.expanduser("~/.claude/projects")      # claude: <slug>/<sid>.jsonl
+CODEX_HISTORY = os.path.expanduser("~/.codex/history.jsonl")  # codex: {"session_id","ts","text"}
+ESPERA_LLEGADA_S = 25   # cuánto se espera ver el prompt registrado después del Enter
+CLAVE_PANEL = "cacho-lanzar"
 
 
 def _get(path, timeout=3):
@@ -111,6 +122,20 @@ def _post(path, body=b"", timeout=10):
             raise
 
 
+def _get_auth(path, timeout=10):
+    """GET con la cookie de sesión (mismo par de intentos que `_post`)."""
+    for intento in (1, 2):
+        req = urllib.request.Request(BASE + path)
+        req.add_header("Cookie", "cacho_sesion=" + _token(renovar=(intento == 2)))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403) and intento == 1:
+                continue
+            raise
+
+
 def ping(silencioso=False):
     try:
         _get("/api/ping")
@@ -155,19 +180,39 @@ REINTENTOS_LLENO = 3
 ESPERA_LLENO_S = 20
 
 
-def crear_pestana(modelo="", area=""):
+def exigir_area(area):
+    """El área limpia, o ValueError. La vara es la del server (`areas.valida`): así el error
+    sale ACÁ, con el nombre del script en el traceback del job, y no como un 400 pelado."""
+    a = (area or "").strip()
+    if not a:
+        raise ValueError("cacho_lanzar: falta el ÁREA de la pestaña (2º argumento: cacho, carla, "
+                         "jaime, eterna, waldemar, xara, ferguson…). Desde el 18-set-2026 es "
+                         "obligatoria: el que abre la pestaña sabe de quién es el trabajo.")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import areas
+    v = areas.valida(a)
+    if not v:
+        raise ValueError("cacho_lanzar: área desconocida %r (las válidas: %s)"
+                         % (a[:40], ", ".join(sorted(areas.POR_CLAVE))))
+    return v
+
+
+def crear_pestana(modelo="", area="", conectores=()):
     """Levanta Cacho si hace falta, crea la pestaña y devuelve su id.
 
     `modelo`: pedido explícito para esta pestaña (p. ej. una cita premium que exige
     Fable). Vacío = el default de la casa (~/.cacho_modelo, hoy Opus).
 
     `area`: de quién es esta corrida (`areas.py`: cacho/carla/jaime/eterna/waldemar/xara/ferguson).
-    Vale la pena declararla SIEMPRE que el que llama lo sepa, y acá lo sabe casi siempre:
-    la rutina de novedades de Google es de Jaime y el vigía de chats es de Carla, no hay
-    nada que deducir. Sin esto, Cacho le adivinaba el área contando palabras del prompt
-    y lo que no reconocía caía en Cacho por descarte — o sea que la tira mostraba de
-    Cacho trabajo que era de otro, y sin ningún error a la vista. Vacío = que la
-    clasifique la máquina, como siempre (queda para el que de verdad no sepa).
+    **OBLIGATORIA desde el 18-set-2026** (plan «optimización del contexto», tanda 1, D9):
+    el que llama lo sabe siempre —la rutina de novedades de Google es de Jaime y el vigía
+    de chats es de Carla, no hay nada que deducir— y lo que nace sin área no se puede
+    medir ni optimizar (la semana del 14-set: 64 sesiones, el 13% del cupo, «sin área»).
+    Hasta hoy, vacío = «que la clasifique la máquina» contando palabras del prompt, y lo
+    que no reconocía caía en Cacho por descarte: la tira mostraba de Cacho trabajo que era
+    de otro, sin ningún error a la vista. Ahora sin área se TIRA acá (ValueError, antes de
+    tocar el server) y el server además contesta 400: un typo en un plist grita, no
+    clasifica mal en silencio. El clasificador queda sólo para las charlas viejas.
 
     Está separado de `tipear()` porque hay dos ritmos distintos: crear la pestaña
     es instantáneo, pero después hay que esperar ~30 s a que el CLI de `claude`
@@ -176,13 +221,17 @@ def crear_pestana(modelo="", area=""):
     dejar el tipeo para un hilo de fondo; si esperara los 30 s, el clic parece
     colgado y el usuario lo toca de nuevo.
     """
+    area = exigir_area(area)
     if not ping(silencioso=True) and not levantar_server():
         raise RuntimeError("El server de Cacho no levanta (ver %s)" % LOG)
-    ruta = "/api/term/new?cwd=%s" % quote(os.getcwd())
+    ruta = "/api/term/new?cwd=%s&area=%s" % (quote(os.getcwd()), quote(area))
     if modelo:
         ruta += "&modelo=%s" % quote(modelo)
-    if area:
-        ruta += "&area=%s" % quote(area)
+    if conectores:
+        # conectores MCP EXTRA para esta pestaña, por fuera de la tabla de su área
+        # (inputs/conectores_areas.json, 18-set-2026): permiso puntual, el server lo deja en su log
+        ruta += "&conectores=%s" % quote(",".join(conectores))
+        print("conectores extra para esta pestaña (%s): %s" % (area, ", ".join(conectores)), file=sys.stderr)
     # El 429 ("ya hay N pestañas abiertas") es TRANSITORIO por definición: alguien cierra
     # una y hay lugar. Hasta el 29-ago-2026 se propagaba como cualquier otro error y la
     # rutina moría con un traceback de urllib — el trabajo NO se hacía y nadie se enteraba
@@ -217,8 +266,9 @@ def crear_pestana(modelo="", area=""):
     return tid
 
 
-def tipear(tid, prompt, esperar=ESPERA_CLAUDE_S):
-    """Le pega el prompt a la pestaña `tid` y manda el Enter."""
+def tipear(tid, prompt, esperar=ESPERA_CLAUDE_S, verificar=True):
+    """Le pega el prompt a la pestaña `tid`, manda el Enter y VERIFICA que el CLI lo tomó
+    (`confirmar_llegada`; `verificar=False` sólo para quien ya verifica por su cuenta)."""
     time.sleep(esperar)
     # pegar el prompt con BRACKETED PASTE (entra atómico: tipearlo rápido en el TUI
     # de claude COME espacios) y el Enter va en un write aparte, un toque después,
@@ -229,11 +279,147 @@ def tipear(tid, prompt, esperar=ESPERA_CLAUDE_S):
     if not rr.get("ok"):
         raise RuntimeError("No pude tipear el prompt en la pestaña: %r" % rr)
     time.sleep(1.5)
+    desde = time.time()
     rr = _post("/api/term/%s/input" % tid,
                body=json.dumps({"d": base64.b64encode(b"\r").decode()}).encode())
     if not rr.get("ok"):
         raise RuntimeError("No pude mandar el Enter en la pestaña: %r" % rr)
+    if verificar:
+        confirmar_llegada(tid, texto, desde)
     return True
+
+
+# ── El candado: «OK» es «el CLI lo tomó», no «lo escribí en el pty» (13-set-2026) ─────────
+# RAÍZ del 12-set: la pestaña nueva de Gpto arrancó en el diálogo «SessionStart hooks — press t
+# to trust» (el server vivo corría la orden vieja, sin --dangerously-bypass-hook-trust), el
+# paste se lo comió el diálogo y esto contestó «OK — tarea corriendo». El pty acepta cualquier
+# byte; la única evidencia de que el prompt ENTRÓ es que el CLI lo haya registrado donde
+# registra lo que le manda el usuario: claude en su transcript (`~/.claude/projects/<slug>/
+# <sid>.jsonl`, línea `type: user`), Codex en `~/.codex/history.jsonl`. Se mira en LOS DOS
+# (así no hay que saber acá qué motor corre cada área) y si en ESPERA_LLEGADA_S no aparece,
+# tira Y deja la alerta en el panel: la pestaña quedó abierta con el pedido perdido, y eso no
+# se resuelve solo en el día — el usuario lo ve, retipea, y cierra con ✓.
+
+def _huella(texto, largo=60):
+    """Los primeros `largo` caracteres con el blanco normalizado: lo que se busca."""
+    return " ".join(str(texto).split())[:largo]
+
+
+def _textos(obj):
+    """Todas las cadenas de un JSON (el `content` de claude es str o lista de bloques)."""
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _textos(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _textos(v)
+
+
+def _lineas_json(ruta, cola=0):
+    """Un .jsonl parseado (lo que no es JSON se saltea); con `cola` sólo sus últimos bytes.
+
+    El transcript de claude se lee ENTERO: el pedido es la primera línea `user` y al
+    confirmar el archivo tiene unos KB. El history de Codex es de toda la vida (crece sin
+    tope) y lo que importa está al final: ése va con cola.
+    """
+    try:
+        with open(ruta, "rb") as fh:
+            if cola:
+                fh.seek(0, 2)
+                fh.seek(max(0, fh.tell() - cola))
+            crudo = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return
+    for linea in crudo.splitlines():
+        try:
+            yield json.loads(linea)
+        except ValueError:
+            continue
+
+
+def _llego_a_claude(sid, huella):
+    """¿El transcript de la sesión `sid` tiene una línea `user` con la huella?"""
+    if not sid:
+        return False
+    try:
+        carpetas = os.listdir(PROJECTS_DIR)
+    except OSError:
+        return False
+    for carpeta in carpetas:
+        ruta = os.path.join(PROJECTS_DIR, carpeta, sid + ".jsonl")
+        if not os.path.isfile(ruta):
+            continue
+        for d in _lineas_json(ruta):
+            if d.get("type") != "user":
+                continue
+            if any(huella in _huella(t, 10**6) for t in _textos(d.get("message"))):
+                return True
+    return False
+
+
+def _llego_a_codex(huella, desde):
+    """¿history.jsonl de Codex tiene, desde `desde`, un pedido con la huella?"""
+    for d in _lineas_json(CODEX_HISTORY, cola=200_000):
+        if float(d.get("ts") or 0) >= desde - 2 and huella in _huella(d.get("text", ""), 10**6):
+            return True
+    return False
+
+
+def _pestana(tid):
+    """La pestaña `tid` según el server (`sid` = su charla, `area`)."""
+    est = _get_auth("/api/estado")
+    for t in est.get("tabs") or []:
+        if t.get("id") == tid:
+            return t
+    raise RuntimeError("Cacho no tiene la pestaña %s (¿se cerró mientras tipeaba?)" % tid)
+
+
+def confirmar_llegada(tid, texto, desde, esperar=ESPERA_LLEGADA_S):
+    """Espera hasta `esperar` s a ver el prompt registrado por el CLI de la pestaña.
+
+    Si aparece, devuelve dónde ("claude" | "codex"). Si no, deja la alerta en el panel y TIRA.
+    """
+    huella = _huella(texto)
+    if not huella:
+        raise RuntimeError("prompt vacío: no hay nada que confirmar")
+    p = _pestana(tid)
+    sid, area = p.get("sid") or "", p.get("area") or ""
+    limite = time.time() + esperar
+    while True:
+        if _llego_a_claude(sid, huella):
+            return "claude"
+        if _llego_a_codex(huella, desde):
+            return "codex"
+        if time.time() >= limite:
+            break
+        time.sleep(1)
+        # el sid de una pestaña de Codex lo vincula el server en vida: releer por si cambió
+        try:
+            p = _pestana(tid)
+            sid = p.get("sid") or sid
+        except Exception:  # noqa: BLE001 — si el server no contesta, se sigue con lo que había
+            pass
+    detalle = ("Pestaña %s (%s). Ni el transcript de claude (%s) ni ~/.codex/history.jsonl "
+               "registraron el pedido en %d s después del Enter. Casi siempre es un diálogo "
+               "del CLI (trust hook, permisos, «press t») que se comió el paste.\n"
+               "Pedido: «%s…»" % (tid, area or "sin área", sid or "sin sid", int(esperar),
+                                   _huella(texto, 160)))
+    try:
+        if PROJ not in sys.path:      # casa_alertas vive en la raíz; sys.path[0] es tools/
+            sys.path.insert(0, PROJ)
+        import casa_alertas as al
+        al.avisar_panel(CLAVE_PANEL, "Un pedido a Cacho NO llegó a su pestaña", detalle,
+                        nivel="alerta", origen="tools/cacho_lanzar.py",
+                        accion="Abrí la pestaña %s en Cacho, destrabá el diálogo y retipeá el "
+                               "pedido (si el que la lanzó ya la cerró, relanzalo); después ✓ "
+                               "acá." % tid,
+                        asunto="perdido:%s" % tid)
+    except Exception as e:  # noqa: BLE001 — el panel no puede tapar el error de verdad
+        print("(no pude dejar la alerta en el panel: %r)" % e, file=sys.stderr)
+    raise RuntimeError("El prompt NO llegó a la pestaña %s: %s" % (tid, detalle.split("\n")[0]))
+
 
 
 def con_memoria_del_area(prompt, area=""):
@@ -258,26 +444,68 @@ def con_memoria_del_area(prompt, area=""):
     return agente_arranque.linea_de_prompt(area) + prompt
 
 
-def lanzar(prompt, area=""):
-    """Crea la pestaña y le deja el prompt corriendo. Devuelve el id de pestaña."""
-    tid = crear_pestana(area=area)
+def lanzar(prompt, area="", conectores=()):
+    """Crea la pestaña y le deja el prompt corriendo. Devuelve el id de pestaña.
+    `area` es obligatoria (ver `crear_pestana`): sin ella, ValueError antes de tocar el server.
+    `conectores`: extra puntual de conectores MCP por fuera de la tabla del área."""
+    area = exigir_area(area)
+    tid = crear_pestana(area=area, conectores=conectores)
     tipear(tid, con_memoria_del_area(prompt, area))
     return tid
 
 
 def main():
-    if len(sys.argv) < 2 or not sys.argv[1].strip():
-        raise SystemExit('Uso: cacho_lanzar.py "<prompt>" [area]')
-    # El área va como 2º argumento POSICIONAL y opcional: los seis llamadores de hoy le
-    # pasan un solo argumento y tienen que seguir andando sin tocarlos. Un área que el
-    # server no conoce lo hace fallar con 400 en vez de crear la pestaña — es lo que se
-    # quiere: un typo en un plist tiene que gritar, no clasificar mal en silencio.
-    area = sys.argv[2].strip() if len(sys.argv) > 2 else ""
+    argv = sys.argv[1:]
+    # `--en <tid>`: el pedido va a una pestaña que YA está abierta, no a una nueva (14-set-2026,
+    # el ➤ del tablero cuando el dueño tiene su pestaña viva). Sin espera de arranque y sin
+    # la línea de memoria del área: esa pestaña ya la tiene. La verificación de llegada es la
+    # misma: «OK» sigue siendo «el CLI lo tomó».
+    en = ""
+    # `--conector <nombre>` (repetible, antes del prompt): un conector MCP extra para esta
+    # pestaña, por fuera de la tabla de su área (18-set-2026). Queda en el log del server.
+    conectores = []
+    while argv[:1] == ["--conector"]:
+        if len(argv) < 2 or not argv[1].strip():
+            raise SystemExit('Uso: cacho_lanzar.py [--conector <nombre>]… "<prompt>" <area>')
+        conectores.append(argv[1].strip())
+        argv = argv[2:]
+    if argv[:1] == ["--en"]:
+        if len(argv) < 2 or not argv[1].strip():
+            raise SystemExit('Uso: cacho_lanzar.py --en <pestaña> "<prompt>" [area]')
+        en, argv = argv[1].strip(), argv[2:]
+    if not argv or not argv[0].strip():
+        raise SystemExit('Uso: cacho_lanzar.py [--en <pestaña>] "<prompt>" <area>')
+    # Un flag donde va el prompt (`--help`, `-h`, un `--area` inventado) NO es un pedido:
+    # sin esto, `cacho_lanzar.py --help` abría una pestaña de Opus con «--help» como
+    # encargo (pasó tres veces, 12/13/16-set-2026: sesiones 1f42f733, 6ad650ae y una más).
+    # El prompt es texto de una persona o de una rutina; nunca empieza con guion.
+    if argv[0].lstrip().startswith("-"):
+        raise SystemExit('Uso: cacho_lanzar.py [--en <pestaña>] "<prompt>" <area>\n'
+                         "El prompt no puede empezar con «-» (recibí %r)." % argv[0][:40])
+    if en:
+        try:
+            tipear(en, argv[0].strip(), esperar=0)
+        except RuntimeError as e:
+            raise SystemExit(str(e)) from e
+        print(f"OK — pedido entregado en la pestaña {en} que ya estaba abierta.")
+        return
+    sys.argv = [sys.argv[0]] + argv
+    # El área va como 2º argumento POSICIONAL y es OBLIGATORIO (18-set-2026; antes opcional
+    # «para no tocar a los seis llamadores», y cuatro plists y un script seguían sin
+    # declararla dos meses después). Un área que el server no conoce falla acá con el
+    # nombre del script a la vista — un typo en un plist tiene que gritar, no clasificar mal
+    # en silencio.
+    if len(sys.argv) < 3 or not sys.argv[2].strip():
+        raise SystemExit('Uso: cacho_lanzar.py [--en <pestaña>] "<prompt>" <area>\n'
+                         "Falta el ÁREA (cacho, carla, jaime, eterna, waldemar, xara, ferguson…): "
+                         "desde el 18-set-2026 es obligatoria, el que abre la pestaña sabe de "
+                         "quién es el trabajo.")
     try:
-        tid = crear_pestana(area=area)
+        area = exigir_area(sys.argv[2])
+        tid = crear_pestana(area=area, conectores=tuple(conectores))
         print(f"pestaña {tid} creada; esperando que levante claude ({ESPERA_CLAUDE_S}s)…")
         tipear(tid, con_memoria_del_area(sys.argv[1].strip(), area))
-    except RuntimeError as e:
+    except (RuntimeError, ValueError) as e:
         raise SystemExit(str(e)) from e
     print(f"OK — tarea corriendo en Cacho (pestaña {tid}).")
 
