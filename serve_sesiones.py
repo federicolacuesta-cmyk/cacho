@@ -168,6 +168,11 @@ BIND = "127.0.0.1"   # NO cambiar a 0.0.0.0: expondría terminales por red
 CHUNK = 256 * 1024   # bytes que se leen de cabeza/cola de cada transcript
 TOPE_COLA = 8 * 1024 * 1024   # hasta dónde se retrocede buscando una línea entera en la cola
 TOPE_BUFFER = 2_000_000  # scrollback que se guarda por terminal
+# Un trabajo de FONDO (Bash con run_in_background) despierta SOLO a la pestaña cuando
+# termina: mientras corre, la pestaña no espera a el usuario aunque haya cerrado el turno
+# (22-set-2026, ver `_fondo_de`). Pasado este tope se lo da por colgado y la pestaña
+# vuelve a contar como «te espera»: algo que no vuelve en 45 min sí lo tiene que ver él.
+TOPE_FONDO = 45 * 60
 COALESCE_MAX = 64 * 1024  # tope al juntar trozos del PTY en un solo evento SSE (ver _stream)
 # El arranque se divide en eventos, pero NUNCA se corta el stream ANSI para
 # aparentar un snapshot. Una cola de bytes no contiene el estado de la terminal.
@@ -312,58 +317,67 @@ GLOBAL_TOPE = 40               # fallos de cualquiera dentro de la ventana
 _GLOBAL = {"fallos": [], "hasta": 0.0, "castigos": 0}
 
 
-def _bloqueado_global():
-    with _FALLOS_LOCK:
-        return max(0.0, _GLOBAL["hasta"] - time.time())
-
-
-def _fallo_global():
-    """Un fallo más para el contador de todos. Devuelve la duración si cerró la puerta."""
-    ahora = time.time()
-    with _FALLOS_LOCK:
-        _GLOBAL["fallos"] = [t for t in _GLOBAL["fallos"] if t > ahora - GLOBAL_VENTANA]
-        _GLOBAL["fallos"].append(ahora)
-        if len(_GLOBAL["fallos"]) < GLOBAL_TOPE:
-            return 0
-        dur = ESCALADA[min(_GLOBAL["castigos"], len(ESCALADA) - 1)]
-        _GLOBAL.update(fallos=[], hasta=ahora + dur, castigos=_GLOBAL["castigos"] + 1)
-        return dur
-
-
 def _bloqueado(ip):
     """Segundos de bloqueo que le quedan a esa IP (0 = puede intentar). El bloqueo global
-    cuenta igual: la puerta está cerrada para todos."""
+    cuenta igual: la puerta está cerrada para todos. Es la mirada BARATA de antes de leer
+    el cuerpo; la que manda es `_reservar_intento`, justo antes de comparar."""
+    ahora = time.time()
     with _FALLOS_LOCK:
         d = _FALLOS.get(ip)
-        propio = max(0.0, d["hasta"] - time.time()) if d else 0.0
-    return max(propio, _bloqueado_global())
+        propio = max(0.0, d["hasta"] - ahora) if d else 0.0
+        return max(propio, _GLOBAL["hasta"] - ahora, 0.0)
 
 
-def _fallo_pin(ip):
-    """Un PIN equivocado. Al octavo, la puerta se cierra por un rato."""
-    dur_global = _fallo_global()
-    if dur_global:
-        _log_seguridad(f"BLOQUEO GLOBAL: {GLOBAL_TOPE} PIN equivocados entre todos en "
-                       f"{GLOBAL_VENTANA}s -> login cerrado {dur_global}s para todos "
-                       f"(castigo #{_GLOBAL['castigos']}); las sesiones abiertas siguen")
+def _reservar_intento(ip):
+    """ADMISIÓN + CUENTA en UNA operación bajo el lock, ANTES de comparar el PIN.
+
+    RAÍZ (Policía sobre fe48c5ab, 20-set-2026): consultar el bloqueo y contar el fallo eran
+    dos pasos separados, y entre uno y otro se leía el cuerpo. 80 requests en paralelo
+    pasaban la consulta juntas y después comparaban las 80 aunque el tope fuera 40: cero
+    429. Ahora el intento se RESERVA acá (cuenta como fallo desde ya, para la IP y para el
+    global); si acierta, `_acierto_pin` lo devuelve. Devuelve los segundos de bloqueo:
+    0 = admitido, comparar; >0 = puerta cerrada, NO se compara."""
+    ahora = time.time()
     with _FALLOS_LOCK:
+        d = _FALLOS.get(ip)
+        espera = max(max(0.0, d["hasta"] - ahora) if d else 0.0, _GLOBAL["hasta"] - ahora, 0.0)
+        if espera:
+            return espera
+        # el contador de TODOS (la botnet)
+        _GLOBAL["fallos"] = [t for t in _GLOBAL["fallos"] if t > ahora - GLOBAL_VENTANA]
+        _GLOBAL["fallos"].append(ahora)
+        dur_global = 0
+        if len(_GLOBAL["fallos"]) >= GLOBAL_TOPE:
+            dur_global = ESCALADA[min(_GLOBAL["castigos"], len(ESCALADA) - 1)]
+            _GLOBAL.update(fallos=[], hasta=ahora + dur_global, castigos=_GLOBAL["castigos"] + 1)
+        # el contador de ESA ip
         if len(_FALLOS) > 1000:        # purga de vencidos, que no crezca sin techo
-            ahora = time.time()
             for k in [k for k, v in _FALLOS.items() if v["hasta"] < ahora]:
                 del _FALLOS[k]
         d = _FALLOS.setdefault(ip, {"n": 0, "hasta": 0.0, "castigos": 0})
         d["n"] += 1
-        if d["n"] < BLOQUEO_TRAS:
-            return
-        dur = ESCALADA[min(d["castigos"], len(ESCALADA) - 1)]
-        d.update(n=0, hasta=time.time() + dur, castigos=d["castigos"] + 1)
-    _log_seguridad(f"BLOQUEO {ip}: {BLOQUEO_TRAS} PIN equivocados seguidos "
-                   f"-> {dur}s de bloqueo (castigo #{d['castigos']})")
+        dur_ip = 0
+        if d["n"] >= BLOQUEO_TRAS:
+            dur_ip = ESCALADA[min(d["castigos"], len(ESCALADA) - 1)]
+            d.update(n=0, hasta=ahora + dur_ip, castigos=d["castigos"] + 1)
+        castigos_g, castigos_ip = _GLOBAL["castigos"], d["castigos"]
+    # el que llegó al tope todavía se compara (como siempre); la puerta se cierra para el siguiente
+    if dur_global:
+        _log_seguridad(f"BLOQUEO GLOBAL: {GLOBAL_TOPE} PIN equivocados entre todos en "
+                       f"{GLOBAL_VENTANA}s -> login cerrado {dur_global}s para todos "
+                       f"(castigo #{castigos_g}); las sesiones abiertas siguen")
+    if dur_ip:
+        _log_seguridad(f"BLOQUEO {ip}: {BLOQUEO_TRAS} PIN equivocados seguidos "
+                       f"-> {dur_ip}s de bloqueo (castigo #{castigos_ip})")
+    return 0
 
 
 def _acierto_pin(ip):
+    """El intento reservado acertó: se le devuelve a la IP y al contador global."""
     with _FALLOS_LOCK:
         _FALLOS.pop(ip, None)
+        if _GLOBAL["fallos"]:
+            _GLOBAL["fallos"].pop()
 
 
 # ─── Sesiones web: el PIN se tipea UNA vez, después manda un token ─────────────
@@ -527,8 +541,11 @@ _RE_TAGS = re.compile(
 
 
 def _limpiar(texto, tope=170):
+    # El tag lleva «_» y «0-9» a propósito: hasta el 21-set-2026 el patrón era `[a-z][a-z-]*`
+    # y `<pasted_content id="e342">` (lo que la terminal envuelve al pegar) quedaba entero en
+    # el resumen de la charla; Karen lo vio en su ventana.
     texto = _RE_TAGS.sub(" ", texto)
-    texto = re.sub(r"</?[a-z][a-z-]*(\s[^>]*)?>", " ", texto)
+    texto = re.sub(r"</?[a-z][a-z0-9_-]*(\s[^>]*)?>", " ", texto)
     texto = re.sub(r"\s+", " ", texto).strip()
     return texto[:tope] + ("…" if len(texto) > tope else "")
 
@@ -594,6 +611,47 @@ def _fin_de(d):
                                                                      "<command-name>")):
         return None   # el eco del comando se escribe DESPUÉS del resumen del compact
     return "pensando"
+
+
+_RE_FONDO_LANZO = re.compile(r"Command running in background with ID: (\w+)")
+_RE_FONDO_ID = re.compile(r"<task-id>(\w+)</task-id>")
+
+
+def _fondo_aviso(txt):
+    """("aviso", id) si este texto es la notificación de un trabajo de fondo que volvió."""
+    if not isinstance(txt, str) or not txt.lstrip().startswith("<task-notification>"):
+        return None
+    m = _RE_FONDO_ID.search(txt)
+    return ("aviso", m.group(1)) if m else None
+
+
+def _fondo_de(d):
+    """Qué dice este registro de los trabajos de FONDO — un Bash con `run_in_background`
+    (22-set-2026). ("lanzo", id) cuando la herramienta contestó «Command running in
+    background with ID: …», ("aviso", id) cuando volvió su `<task-notification>`, o None.
+
+    Un trabajo de fondo pendiente cambia el sentido de un turno cerrado: cuando termina,
+    Claude Code DESPIERTA solo a la pestaña, así que no espera a nadie (la misma razón por
+    la que `_fin_de` ya perdona los subagentes con `pendingBackgroundAgentCount`).
+
+    Se lee SÓLO del bloque `tool_result` y del mensaje de la notificación, nunca del texto
+    de la charla: la misma frase escrita o pegada en el chat inventaría un trabajo de fondo
+    que no existe (pasa, por ejemplo, mientras se depura esto mismo)."""
+    t = d.get("type")
+    if t == "queue-operation":
+        return _fondo_aviso(d.get("content"))
+    if t != "user" or d.get("isSidechain"):
+        return None
+    contenido = (d.get("message") or {}).get("content")
+    if isinstance(contenido, str):
+        return _fondo_aviso(contenido)
+    if isinstance(contenido, list):
+        for b in contenido:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                m = _RE_FONDO_LANZO.match(str(b.get("content") or "").lstrip())
+                if m:
+                    return ("lanzo", m.group(1))
+    return None
 
 
 _RE_ARCHIVO = re.compile(
@@ -831,6 +889,9 @@ def _leer_sesion(path):
         "icono": "", "tema": "", "tema_ini": "", "area": areas.DEFECTO,
         "contexto": "", "pedido": "",
         "fin": "",   # cómo termina la charla (ver _fin_de): decide «te espera»
+        # trabajos de FONDO todavía corriendo (ver _fondo_de): cuántos y desde cuándo el
+        # más nuevo. Con uno pendiente, un turno cerrado NO es «te espera».
+        "fondo": 0, "fondo_ts": 0.0,
         # cuánto pesa arrastrar esta charla (24-ago-2026). Sale de tail_lines,
         # que ya se leyó: no agrega ni una lectura de disco al refresco del panel.
         "ctx_tokens": 0, "peso": costo_sesion.VERDE, "peso_nota": "",
@@ -867,6 +928,7 @@ def _leer_sesion(path):
     # Lo último que pasó, para deducir el tema de ahora: texto de los últimos
     # mensajes, la herramienta más reciente (el verbo) y los archivos tocados.
     recientes, tools_rec, objs_rec = [], [], []
+    fondo_lanzados, fondo_avisados = {}, set()   # id → ts del lanzamiento / ids que volvieron
     for line in reversed(tail_lines or head_lines):
         d = _parse_linea(line)
         if not d:
@@ -885,6 +947,12 @@ def _leer_sesion(path):
             s["branch"] = d["gitBranch"]
         if not s["fin"]:
             s["fin"] = _fin_de(d) or ""
+        fondo = _fondo_de(d)
+        if fondo:
+            if fondo[0] == "aviso":
+                fondo_avisados.add(fondo[1])
+            else:
+                fondo_lanzados[fondo[1]] = _iso_a_epoch(d.get("timestamp") or "")
         if d.get("type") not in ("user", "assistant") or d.get("isMeta") or d.get("isSidechain"):
             continue
         contenido = (d.get("message") or {}).get("content")
@@ -919,6 +987,10 @@ def _leer_sesion(path):
         elif tools:
             s["ultimo_quien"] = "Claude"
             s["ultimo_txt"] = "⚙ " + ", ".join(dict.fromkeys(tools))
+
+    pendientes = [ts for bid, ts in fondo_lanzados.items() if bid not in fondo_avisados]
+    s["fondo"] = len(pendientes)
+    s["fondo_ts"] = max(pendientes) if pendientes else 0.0
 
     if not (s["primer_msg"] or s["titulo"]):
         resultado = None
@@ -992,7 +1064,7 @@ def _buscar_transcript(sid):
 def _limpiar_multilinea(texto, tope=6000):
     """Como _limpiar pero conservando los saltos de línea (para el visor)."""
     texto = _RE_TAGS.sub(" ", texto)
-    texto = re.sub(r"</?[a-z][a-z-]*(\s[^>]*)?>", " ", texto)
+    texto = re.sub(r"</?[a-z][a-z0-9_-]*(\s[^>]*)?>", " ", texto)
     texto = re.sub(r"[ \t]+", " ", texto)
     texto = re.sub(r"\n{3,}", "\n\n", texto).strip()
     return texto[:tope] + ("…" if len(texto) > tope else "")
@@ -1352,6 +1424,7 @@ def configuracion():
         m["vigia_fable"] = {}
     m["boot"] = BOOT_ID
     m["max_tabs"] = MAX_TABS
+    m["cupo_jaulas"] = CUPO_JAULAS_TOTAL   # cuántas de esas pueden ser de una jaula
     d["maquina"] = m
     with _CONF_LOCK:
         _CONF_CACHE["datos"] = d; _CONF_CACHE["hasta"] = time.time() + 60
@@ -1744,6 +1817,9 @@ class TermSession:
             threading.Thread(target=self._auto_claude, daemon=True).start()
         if self.charla and not self.adoptada:
             threading.Thread(target=self._abrir_aviso, daemon=True).start()
+        elif self.pedido and not self.adoptada:
+            # Nació porque alguien ESCRIBIÓ (no porque tocó ＋): su texto es el primer mensaje.
+            threading.Thread(target=self._primer_mensaje, daemon=True).start()
 
     # ── La pestaña que nace de un link `#c=<charla>` abre ESA charla sola (15-set-2026) ──
     # RAÍZ. Cada WhatsApp a Administración lleva al pie `…/?de=xara#c=<id>` (regla dura del
@@ -1807,11 +1883,67 @@ class TermSession:
                 return False
         return False
 
+    @staticmethod
+    def _huella_de(pedido):
+        """El pedazo del pedido que se busca en el transcript como prueba de que ENTRÓ.
+
+        RAÍZ (22-set-2026): la huella era una frase FIJA del pedido por defecto («link a la
+        charla #c=…»), pero cuando la pestaña nace de un PENDIENTE el texto es otro («Abrí mi
+        pendiente «…»: es la charla #c=…»), así que no aparecía nunca y salía el cartel «No me
+        consta que Xara haya tomado el pedido» con el pedido perfectamente entregado — 16 veces
+        en el log. La huella se saca de lo que REALMENTE se mandó, no de lo que se suponía.
+
+        El transcript es JSON, así que se devuelve el trozo ya escapado como lo escribe el CLI.
+        Sin pedido no hay huella: el que llama NO inventa un ✓ ni un ✗ (devuelve "")."""
+        linea = max((l.strip() for l in (pedido or "").splitlines()), key=len, default="")
+        trozo = linea[:80].rstrip()
+        return json.dumps(trozo, ensure_ascii=False)[1:-1] if trozo else ""
+
+    def tipear_pedido(self, pedido, marcar=None):
+        """Le tipea un pedido a una pestaña que YA está viva (bracketed paste + Enter, el mismo
+        par que `_abrir_aviso`) y recién después corre `marcar()`.
+
+        RAÍZ (lo cazó el Policía, 21-set-2026): las charlas de Administración se reutilizan
+        por tema y mes, así que el SEGUNDO aviso a la misma charla encontraba la pestaña
+        abierta y `/api/term/new` la devolvía tal cual —sin tipearle el pedido nuevo— pero
+        igual marcaba la tarjeta como tocada; y un aviso tocado se cierra y cancela su
+        WhatsApp de respaldo. Enfocar una pestaña NO es mostrar el aviso: el pedido entra, y
+        la tarjeta se marca sólo si entró. Con el TUI ocupado el texto queda en su cola de
+        entrada y sale al terminar la respuesta en curso; eso es entregarlo."""
+        try:
+            self.escribir(("\x1b[200~" + pedido + "\x1b[201~").encode())
+            time.sleep(1.5)
+            self.escribir(b"\r")
+        except OSError as e:
+            self._cartel("No pude pasarle el pedido nuevo (%s). Decile: «%s»" % (e, pedido[:160]))
+            print("⚠️ pestaña %s: no pude tipear el pedido nuevo: %s" % (self.id, e), file=sys.stderr)
+            return False
+        if marcar:
+            marcar()
+        return True
+
+    def _primer_mensaje(self):
+        """El primer mensaje de una pestaña que nació de un TEXTO (22-set-2026).
+
+        RAÍZ (el usuario, con la ventana de la Constructora en el teléfono): *«cómo empieza una
+        conversación… que sea lo más parecido a WhatsApp posible»*. Para hablarle había que
+        abrir el cajón, tocar ＋, esperar a que naciera la pestaña y recién ahí escribir —
+        cuatro pasos y un botón escondido para lo que en WhatsApp es UNO: escribís y mandás.
+        El eslabón es éste: la pestaña puede nacer CON el mensaje, y el server lo tipea solo
+        cuando el TUI dibujó su prompt (pegarlo antes se lo come la pantalla de arranque)."""
+        if not self._esperar_listo():
+            self._cartel("No vi arrancar la conversación a tiempo. Tu mensaje NO entró; "
+                         "está acá y lo podés pegar: «%s»" % self.pedido[:300])
+            print("⚠️ pestaña %s: claude no dibujó el prompt en %ds, no entró el primer mensaje"
+                  % (self.id, self.ESPERA_LISTO_S), file=sys.stderr)
+            return
+        self.tipear_pedido(self.pedido)
+
     def _abrir_aviso(self):
         cid = self.charla
         # Xara (Administración) o Eterna (Supervisión): las dos tienen la mano `avisos` y el
         # pedido es el mismo; sólo cambia a quién se le habla en los carteles.
-        asistente = "Eterna" if getattr(self, "area", "") == "eterna" else "Xara"
+        asistente = {"eterna": "Eterna", "waldemar": "Waldemar"}.get(getattr(self, "area", ""), "Xara")
         pedido = self.pedido or (
                  "Me llegó un WhatsApp de la casa con el link a la charla #c=%s. Abrila entera "
                  "(mano avisos, charla %s), mostrame el mensaje tal cual llegó y seguimos desde "
@@ -1832,7 +1964,9 @@ class TermSession:
                          % (cid, e, asistente, cid))
             return
         fin = time.time() + self.ESPERA_LLEGADA_S
-        huella = "link a la charla #c=%s" % cid
+        huella = self._huella_de(pedido)
+        if not huella:
+            return                      # sin huella no se puede afirmar nada: no se avisa al pedo
         while time.time() < fin:
             if self._transcript_tiene(huella):
                 return
@@ -1852,11 +1986,14 @@ class TermSession:
         # los escribe siempre; el extra sólo agrega `autoMemoryDirectory`).
         settings = self.jaula["settings"]
         perfil = self.jaula.get("perfil") or cacho_perfiles.ADMIN
-        if self.area and agente_arranque and cacho_perfiles and perfil == cacho_perfiles.ADMIN:
-            # Sólo Administración precarga la memoria del área; un supervisor no lee el repo.
+        if self.area and agente_arranque and cacho_perfiles and perfil in (cacho_perfiles.ADMIN,
+                                                                             cacho_perfiles.CONSTRUCTORA):
+            # Administración precarga la memoria del área (un supervisor no lee el repo); la
+            # Constructora (20-set-2026) precarga la memoria de SU casa y el deny de TODOS los
+            # conectores (no tiene ninguno: Notion entra por su propia llave).
             extra = agente_arranque.ajustes(self.area)
             if extra:
-                settings = cacho_perfiles.escribir_permisos(extra=extra)
+                settings = cacho_perfiles.escribir_permisos(extra=extra, perfil=perfil)
         cmd = [binario, "--settings", settings]
         modelo = self.modelo_pedido or _modelo_preferido()
         if modelo:
@@ -2050,7 +2187,86 @@ class TermSession:
 
 TABS = {}          # id -> TermSession
 TABS_LOCK = threading.Lock()
-MAX_TABS = 30      # techo de pestañas simultáneas (ver /api/term/new)
+
+# ─── El TECHO sale de la MÁQUINA y el cupo tiene DUEÑOS (22-set-2026) ─────────────────
+# el usuario: «todo el mundo tiene sesiones abiertas conmigo y me quedo sin cupo; cuando yo
+# quiero abrir, están ocupadas por esa otra gente». Dos raíces, las dos acá:
+#
+#  1) EL TECHO ERA UN NÚMERO A OJO. Los 30 se pusieron cuando la casa era el usuario solo, para
+#     que un cliente en bucle no dejara la máquina sin memoria. Medido el 22-set-2026 en
+#     la Studio con 31 pestañas vivas: 16,4 GB de `claude` (media 0,53 GB, pico 0,67),
+#     64 GB de RAM, swap 0, 92% de memoria libre, load 5,7 sobre 20 núcleos. O sea: el 30
+#     no lo pedía la máquina, lo pedía el número. Ahora sale de la RAM física con un
+#     presupuesto por pestaña MEDIDO, y se dice en el arranque cuánto dio.
+#  2) EL POTE ERA UNO Y SIN DUEÑOS. Administración, Supervisión, Producto y la
+#     Constructora sacan del mismo pote que el usuario, y el primero que llega se lo lleva: una
+#     charla dormida de una jaula le sacaba el lugar al dueño de la casa. Ahora cada jaula
+#     tiene su cupo y lo que sobra es del usuario — una jaula NUNCA puede llenar la máquina.
+#
+# Lo que NO se toca acá: quién puede entrar (eso es `cacho_perfiles`) ni cuánta plata
+# gasta cada uno (mismo login de Claude para todos; eso es otra decisión, del usuario).
+RAM_POR_PESTANA_GB = 0.7      # pico medido; la media es 0,53 (una pestaña = zsh + claude + pty)
+RESERVA_CASA_GB = 20          # lo que en esta máquina NO es una pestaña: Chrome, los ~107
+                              # jobs de launchd, el Espejo, Playwright, el propio server
+TECHO_MIN, TECHO_MAX = 12, 48   # piso (una máquina chica igual sirve) y techo prudente: por
+                                # encima de 48 manda el CPU, que esto no mide
+
+
+def _techo_pestanas(ram_gb=None):
+    """Cuántas pestañas aguanta ESTA máquina, con la RAM que tiene puesta.
+
+    Un fallo al preguntarle al kernel no puede dejar la casa sin techo (sin techo, un
+    cliente en bucle la funde): ante la duda, el piso. `ram_gb` es para el test."""
+    if ram_gb is None:
+        try:
+            ram_gb = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
+                                        text=True, timeout=5).stdout.strip()) / (1024 ** 3)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            print(f"⚠️ no pude medir la RAM ({exc!r}): techo de pestañas en el piso "
+                  f"({TECHO_MIN})", file=sys.stderr)
+            return TECHO_MIN
+    cabe = int((ram_gb - RESERVA_CASA_GB) / RAM_POR_PESTANA_GB)
+    return max(TECHO_MIN, min(TECHO_MAX, cabe))
+
+
+MAX_TABS = _techo_pestanas()   # techo de pestañas simultáneas (ver /api/term/new)
+
+# Cupo por JAULA (el `perfil` de cacho_perfiles). Lo que no está acá es del usuario: él no
+# tiene cupo propio porque es el resto. Una jaula nueva entra con CUPO_JAULA_OTRA hasta
+# que se le mida el uso, y el total de las jaulas no pasa de CUPO_JAULAS_TOTAL.
+CUPO_JAULA = {
+    "administracion": 8,   # Flo, Karen, Xime (y una charla por persona, no por tema)
+    "supervision": 4,      # Andrea, Caro, Fernando
+    "producto": 3,         # Brian, Gabriel, Rodolfo
+    "constructora": 3,     # Mauro y el Negro (otra empresa)
+    "legado": 3,           # Pochi y Caro, y una de sobra: acá nadie espera su turno
+}
+CUPO_JAULA_OTRA = 2
+CUPO_JAULAS_TOTAL = 14     # entre TODAS: con el techo medido le quedan ≥34 a el usuario
+
+
+def _lugar_para(perfil, quien):
+    """"" si esa persona puede abrir otra pestaña, o el motivo EN CRIOLLO (lo lee ella).
+
+    Se pregunta después de cosechar las muertas: el tope se mide contra pestañas vivas."""
+    with TABS_LOCK:
+        tabs = list(TABS.values())
+    if len(tabs) >= MAX_TABS:
+        return (f"ya hay {MAX_TABS} pestañas abiertas en la máquina; "
+                "cerrá alguna con la ✕")
+    if not perfil or perfil == "duenio":   # el usuario no tiene cupo: es el resto del pote
+        return ""
+    de_jaulas = [t for t in tabs if t.duenio != "duenio"]
+    if len(de_jaulas) >= CUPO_JAULAS_TOTAL:
+        return (f"ya hay {CUPO_JAULAS_TOTAL} charlas abiertas entre todas las áreas; "
+                "cerrá una con la ✕ y volvé a entrar")
+    cupo = CUPO_JAULA.get(perfil, CUPO_JAULA_OTRA)
+    suyas = [t for t in de_jaulas if (t.jaula or {}).get("perfil") == perfil]
+    if len(suyas) >= cupo:
+        return (f"ya hay {cupo} charlas abiertas de tu equipo; cerrá una con la ✕ "
+                "y volvé a entrar")
+    return ""
+
 _mapeo_pid = {}    # transcript_id -> pid del proceso claude que le corresponde
 
 # ─── Metadatos por sesión: FIJADA / ORDEN / NOMBRE PROPIO ───
@@ -2314,7 +2530,15 @@ def _restaurar_pestanas():
                 print(f"⚠️ no pude reabrir a {ar}: {e!r}", file=sys.stderr)
                 continue
             if t.transcript_id:
-                _meta_set(t.transcript_id, {"area": ar})
+                # Una reapertura en limpio (sin hilo) es OTRO nacimiento automático y deja
+                # rastro como los demás (Policía 21-set-2026); con hilo, el origen es el de
+                # la charla y se conserva.
+                campos = {"area": ar}
+                if not thread or not (_meta_leer().get(t.transcript_id) or {}).get("origen"):
+                    campos["origen"] = _origen_nacimiento("reinicio", "cacho", "local", "")
+                    print("✚ pestaña %s (%s) nació: %s" % (t.id, ar, _origen_en_criollo(campos["origen"], con_hora=True)),
+                          file=sys.stderr)
+                _meta_set(t.transcript_id, campos)
             with TABS_LOCK:
                 TABS[t.id] = t
             abiertas += 1
@@ -2458,10 +2682,94 @@ def _pestana_de_charla(quien, charla):
                      and (meta.get(x.transcript_id) or {}).get("charla") == charla), None)
 
 
+def _charla_dormida(quien, charla):
+    """El sid de la ÚLTIMA charla de esa persona con ese id del almacén de Xara que ya NO
+    tiene pestaña viva, o "". Es lo que hace que el autocierre por inactividad no se note:
+    la persona vuelve a tocar el link del WhatsApp y la charla sigue donde estaba, en vez
+    de nacer una Xara que no se acuerda de nada (22-set-2026).
+
+    La pared es la de siempre: una charla es suya sólo si el DUEÑO anotado es quien
+    pregunta (`_duenio_de`); si no, la charla de otra persona de la misma jaula se
+    retomaría por el link."""
+    if not quien or not charla:
+        return ""
+    meta = _meta_leer()
+    with TABS_LOCK:
+        vivas = {t.transcript_id for t in TABS.values() if t.viva and t.transcript_id}
+    candidatas = []
+    for sid, m in meta.items():
+        if (m or {}).get("charla") != charla or sid in vivas:
+            continue
+        if _duenio_de(sid, meta) != quien:
+            continue
+        ruta = _buscar_transcript(sid)
+        if not ruta:
+            continue
+        try:
+            candidatas.append((os.path.getmtime(ruta), sid))
+        except OSError:
+            continue
+    return max(candidatas)[1] if candidatas else ""
+
+
 def _area_declarada(sid):
     """El área que el usuario DECLARÓ para una charla (meta de `sesiones.json`), o "". Es la
     misma vara que `_aplicar_meta`: validada contra `areas.py`, nunca la adivinada."""
     return areas.valida((_meta_leer().get(sid) or {}).get("area") or "") or ""
+
+
+# Cómo nació una pestaña, en criollo (21-set-2026, «se disparan sesiones solas»). La clave
+# `por` la manda quien crea la pestaña; lo que no está acá se muestra tal cual vino.
+POR_EN_CRIOLLO = {
+    "cara": "tocaste la cara (no tenía ninguna viva)",
+    "mas": "tocaste el ＋",
+    "paleta": "desde la paleta ⌘K",
+    "nueva-pesada": "«Nueva» de una charla pesada",
+    "aviso": "abriste el link de un WhatsApp de la casa",
+    "pendiente": "tocaste un pendiente",
+    "retomar": "retomada",
+    "reinicio": "reabierta tras un reinicio de Cacho",
+}
+
+
+def _dispositivo(ua):
+    """El aparato, corto, desde el User-Agent: es lo que el usuario lee («iPhone»), no el UA."""
+    ua = ua or ""
+    if not ua or ua.startswith("Python-urllib"):
+        return "script"
+    if "iPhone" in ua:
+        return "iPhone"
+    if "iPad" in ua:
+        return "iPad"
+    if "Android" in ua:
+        return "Android"
+    if "Macintosh" in ua:
+        return "Mac"
+    if "Windows" in ua:
+        return "Windows"
+    return ua[:30]
+
+
+def _origen_nacimiento(por, quien, ip, ua):
+    return {"cuando": datetime.now().strftime("%Y-%m-%d %H:%M"), "por": por,
+            "quien": quien or "duenio", "desde": ip or "?", "aparato": _dispositivo(ua)}
+
+
+def _origen_en_criollo(o, con_hora=False):
+    """«nació 09:20 · duenio · tocaste la cara · iPhone». Lo leen el log y el renglón."""
+    if not isinstance(o, dict):
+        return ""
+    por = o.get("por") or "?"
+    if por.startswith("script:"):
+        como = "la lanzó " + por[len("script:"):]
+    else:
+        como = POR_EN_CRIOLLO.get(por, por)
+    partes = ["nació " + (o.get("cuando") or "?")] if con_hora else \
+             ["nació " + (o.get("cuando") or "?")[-5:]]
+    partes += [o.get("quien") or "duenio", como, o.get("aparato") or "?"]
+    if con_hora:
+        partes.append("desde " + (o.get("desde") or "?"))
+    return " · ".join(p for p in partes if p)
 
 
 def _aplicar_meta(item, sid, meta):
@@ -2489,6 +2797,8 @@ def _aplicar_meta(item, sid, meta):
         item["renombrada"] = True
     # La charla del almacén de Xara que trajo esta pestaña (link `#c=`), o "".
     item["charla"] = m.get("charla") or ""
+    # Cómo nació, ya en criollo: el front no interpreta claves, las muestra.
+    item["origen"] = _origen_en_criollo(m.get("origen"))
     return item
 
 
@@ -2690,12 +3000,101 @@ def _cerrar_encargos_completos():
             print("⚠️ no pude cerrar el encargo de %s: %s" % (t.id, exc), file=sys.stderr)
 
 
+# ── Una charla de JAULA dormida se cierra sola (22-set-2026) ─────────────────────────
+# Hasta hoy una pestaña sólo se cerraba sola por «✓ Encargo completo.», y eso es del usuario:
+# las jaulas no firman. Resultado: la charla que Karen abrió a las 9 seguía ocupando lugar
+# a las 18 con nadie del otro lado, y el cupo de la casa se llenaba de silencio.
+#
+# NO es «cerrar por si acaso»: 30 minutos sin que la persona escriba NI el transcript
+# crezca es la prueba de que del otro lado no hay nadie ni nada corriendo.
+# La charla NO se pierde: queda en su historial con el ⟳, y si vuelve por el link del
+# WhatsApp se retoma sola (`_charla_dormida`).
+#
+# RAÍZ (22-set-2026, el mismo día): el primer intento midió la quietud con `last_out`, o
+# sea BYTES EN EL PTY, con el argumento de que la TUI redibuja el spinner mientras
+# trabaja. Es cierto al revés pero no de ida: la TUI de Claude también dibuja SOLA con
+# nadie del otro lado, cada media hora larga. Medido en producción: las pestañas de
+# Karen (3d0274e6) y Flo (e791fde6) llegaron a 1.756 s quietas y el reloj se les reseteó
+# a cero a las 13:05 con el transcript sin tocar desde las 12:36, y la de Xime (84a3afb7)
+# hizo lo mismo a las 12:58 con el suyo frío desde las 12:23. Con el umbral en 30 min y
+# el latido de la TUI en ~30 min, el cierre no iba a pasar NUNCA: en 50 minutos de
+# producción con 8 jaulas vivas no cerró ninguna.
+# Lo que sí prueba que hay alguien: lo que la persona TIPEA (`last_input`) y lo que el
+# turno ESCRIBE (el .jsonl crece en cada mensaje y en cada herramienta). El pty queda
+# sólo como freno: si dibujó hace menos de un minuto hay un turno en curso y no se toca.
+INACTIVIDAD_JAULA_S = 30 * 60
+# Un pty que dibujó recién = TUI viva trabajando (el mismo criterio que `estado_general`,
+# con más aire porque acá se MATA una pestaña).
+DIBUJANDO_S = 60
+
+
+def _mtime_transcript(sid):
+    """Cuándo creció por última vez el .jsonl de esa charla, o 0 si no hay.
+
+    Es el reloj del TRABAJO: Claude escribe una línea por mensaje y por herramienta, así
+    que mientras el turno avanza esto se mueve. 0 = no sé, y `_cerrar_jaulas_dormidas`
+    lo trata como «no cierro» (ver ahí)."""
+    if not sid:
+        return 0.0
+    try:
+        ruta = _buscar_transcript(sid)
+        return os.path.getmtime(ruta) if ruta else 0.0
+    except OSError:
+        return 0.0
+
+
+def _cerrar_jaulas_dormidas():
+    ahora = time.time()
+    with TABS_LOCK:
+        tabs = [t for t in TABS.values() if t.viva and t.duenio != "duenio"]
+    for t in tabs:
+        quieta = ahora - max(t.last_input, t.creado)
+        if quieta < INACTIVIDAD_JAULA_S:
+            continue
+        # Recién acá se mira el disco: para las que ya pasaron el umbral del teclado, no
+        # para las 14 cada 2 segundos.
+        mt = _mtime_transcript(t.transcript_id)
+        if not mt:
+            # Sin transcript no se sabe si hay un turno corriendo: no se mata a ciegas
+            # («no lo vi» nunca es un valor).
+            continue
+        quieta = min(quieta, ahora - mt)
+        if quieta < INACTIVIDAD_JAULA_S:
+            continue
+        if ahora - t.last_out < DIBUJANDO_S:
+            continue
+        try:
+            with t.input_lock:
+                # Entró algo mientras mirábamos: no se cierra (misma guardia que el cierre
+                # por encargo completo).
+                if max(t.last_out, t.last_input) > ahora:
+                    continue
+                with TABS_LOCK:
+                    if TABS.get(t.id) is not t:
+                        continue
+                t.matar()
+                with TABS_LOCK:
+                    TABS.pop(t.id, None)
+            _guardar_pestanas_vivas(silencioso=True)
+            print("jaula dormida: %s (%s) cerrada tras %d min sin tipear ni escribir "
+                  "transcript; historial %s conservado"
+                  % (t.id, t.duenio, quieta / 60, t.transcript_id or "-"),
+                  file=sys.stderr)
+        except Exception as exc:                                   # noqa: BLE001
+            print("⚠️ no pude cerrar la pestaña dormida de %s: %s" % (t.duenio, exc),
+                  file=sys.stderr)
+
+
 def _autocierre_periodico():
     while True:
         try:
             _cerrar_encargos_completos()
         except Exception as exc:
             print("⚠️ autocierre falló: %s" % exc, file=sys.stderr)
+        try:
+            _cerrar_jaulas_dormidas()
+        except Exception as exc:                                   # noqa: BLE001
+            print("⚠️ autocierre de jaulas dormidas falló: %s" % exc, file=sys.stderr)
         time.sleep(2)
 
 
@@ -2710,6 +3109,36 @@ def _muerta(p):
     las vio como terminadas: no lo estaban, había que retomarlas. El dato ya existía
     (`fin`, ver _fin_de); sólo faltaba decirlo."""
     return "cortada" if p and p.get("fin") in ("pensando", "herramienta") else "terminada"
+
+
+# ── el tablero de la Constructora (lo que ve el Negro al entrar) ──────────────────────
+def tablero_constructora(fresco=False):
+    """Las tarjetas que ve el Negro en su ventana, resueltas contra SU base de Notion.
+
+    Acá NO se decide qué mostrar: el tablero (`inputs/tablero.json` en la casa de ellos)
+    lo edita el asistente de esa empresa, y el `tablero.py` de esa casa lo resuelve. Se corre
+    como un proceso APARTE a propósito: la llave de Notion de la otra empresa no tiene por qué
+    entrar a este server — igual que la jaula, la pared es dónde vive cada cosa, no la buena
+    voluntad de nadie.
+
+    Un fallo se devuelve con todas las letras: una tarjeta en blanco no le dice al Negro si no
+    hay datos o si se rompió algo.
+    """
+    guion = os.path.join(cacho_perfiles.CASA_CONSTRUCTORA, "tools", "tablero.py")
+    if not os.path.exists(guion):
+        return {"error": "El tablero todavía no está armado en la casa de la Constructora."}
+    cmd = [sys.executable, guion, "--json"] + (["--fresco"] if fresco else [])
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=90,
+                           cwd=cacho_perfiles.CASA_CONSTRUCTORA)
+    except subprocess.TimeoutExpired:
+        return {"error": "La base tardó demasiado en contestar. Probá de nuevo en un minuto."}
+    if r.returncode != 0:
+        return {"error": (r.stderr or r.stdout or "").strip()[:400] or "No pude armar el tablero."}
+    try:
+        return json.loads(r.stdout)
+    except ValueError:
+        return {"error": "El tablero contestó algo que no entiendo: %s" % (r.stdout or "")[:200]}
 
 
 def estado_general(duenio="duenio", perfil="duenio"):
@@ -2738,6 +3167,12 @@ def estado_general(duenio="duenio", perfil="duenio"):
     for t in sorted(tabs, key=lambda x: x.creado):
         p = next((x for x in parseadas if x["id"] == t.transcript_id), None)
         quieto = ahora - t.last_out
+        # Un trabajo de fondo corriendo (Bash con run_in_background) despierta SOLO a la
+        # pestaña cuando termina: mientras tanto NO espera a el usuario aunque haya cerrado el
+        # turno (22-set-2026: «si me dice te espera es porque voy y veo que está haciendo
+        # algo»; la pestaña decía «te espera 46 s» esperando al Policía). Pasado TOPE_FONDO
+        # se lo da por colgado y vuelve a esperar: eso sí lo tiene que ver él.
+        en_fondo = bool(p and p.get("fondo") and (ahora - p.get("fondo_ts", 0)) < TOPE_FONDO)
         if not t.viva:
             estado = _muerta(p)
         elif p and p["fin"] == "termino":
@@ -2756,6 +3191,8 @@ def estado_general(duenio="duenio", perfil="duenio"):
             estado = "trabajando" if quieto < 8 else "esperando"
         else:
             estado = "trabajando" if quieto < 6 else "esperando"
+        if t.viva and en_fondo and estado == "esperando":
+            estado = "trabajando"      # lo que espera es su propio trabajo, no a el usuario
         # «Te espera» ≠ «quieta»: una pestaña nueva sin nada escrito está quieta y
         # no espera nada. Es lo que cuenta y muestra el 🔔 (11-set-2026).
         te_espera = (estado == "esperando" and bool(p)
@@ -2802,6 +3239,11 @@ def estado_general(duenio="duenio", perfil="duenio"):
             "peso": (p or {}).get("peso", costo_sesion.VERDE),
             "peso_nota": (p or {}).get("peso_nota", ""),
         }, t.transcript_id, meta))
+        # Desde el 21-set-2026 toda pestaña compacta sola al tope (`autoCompactWindow`, 300k
+        # desde el 22-set; el número manda `costo_sesion.TOPE_AUTOCOMPACT`); una
+        # VIVA en rojo es el tope sin regir y va al panel de la casa (costo_sesion.vigilar).
+        costo_sesion.vigilar(t.transcript_id or "", (p or {}).get("ctx_tokens", 0), bool(t.viva),
+                             (p or {}).get("mtime", 0.0))
 
     ttys_mios = {t.tty.replace("/dev/", "") for t in tabs}
     procs = procesos_claude(ttys_mios)
@@ -2887,7 +3329,7 @@ def estado_general(duenio="duenio", perfil="duenio"):
         area_pf = cacho_perfiles.PERFILES[perfil]["area"] if cacho_perfiles else "xara"
         out["areas"] = [a for a in out["areas"] if a.get("clave") == area_pf]
         out["area_defecto"] = area_pf
-        out["marca"] = Handler.MARCAS[perfil]
+        out["marca"] = cacho_perfiles.marca(perfil) if cacho_perfiles else Handler.MARCAS[perfil]
         # Sus pendientes (el usuario, 17-set-2026: «que le salga como a mí en el dashboard»). Se
         # mandan sólo los de QUIEN pregunta: el filtro va acá, como el de las pestañas. Son
         # de Administración: un supervisor no tiene tarjetas de ésas.
@@ -3129,6 +3571,15 @@ class Handler(BaseHTTPRequestHandler):
     _COOKIE_SESION = ("cacho_sesion={tok}; Path=/; Max-Age=31536000; "
                       "SameSite=Lax; HttpOnly")
 
+    def _cookie_sesion(self, tok):
+        """La cookie con `Secure` cuando entra por el Funnel (https), como Xara y el panel del
+        equipo; en una prueba local por http tiene que seguir andando (20-set-2026, propuesta 6
+        del vigía de novedades: Max-Age ya lo tenía, faltaba esto)."""
+        c = self._COOKIE_SESION.format(tok=tok)
+        if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https":
+            c += "; Secure"
+        return c
+
     @property
     def _ip(self):
         """La IP de quien de verdad pide. Por el proxy de Tailscale (tailnet o Funnel) TODO
@@ -3219,20 +3670,20 @@ class Handler(BaseHTTPRequestHandler):
         (?pin=) o un ticket de un solo uso (?t=, el que usa el lanzador). Cuenta
         como intento: si está mal, suma al freno."""
         q = parse_qs(urlparse(self.path).query)
+        if not q.get("t") and not q.get("pin"):
+            return False
+        if _reservar_intento(self._ip):     # puerta cerrada: no se compara nada
+            return False
         if q.get("t"):
             if _ticket_usar(q["t"][0]):
                 _acierto_pin(self._ip)
                 return True
-            _fallo_pin(self._ip)
-            return False
-        if not q.get("pin"):
             return False
         perfil, quien = _quien_es(q["pin"][0])
         if perfil:
             _acierto_pin(self._ip)
             self._login = (perfil, quien)
             return True
-        _fallo_pin(self._ip)
         return False
 
     def _seguridad(self, referrer="no-referrer"):
@@ -3262,7 +3713,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _marca(self):
         f = _sesion_valida(self._cookie("cacho_sesion")) or {}
-        return self.MARCAS.get(f.get("perfil") or "duenio")
+        perfil = f.get("perfil") or "duenio"
+        if cacho_perfiles and perfil in self.MARCAS:
+            return cacho_perfiles.marca(perfil)      # la de la Constructora lleva el nombre que eligió el Negro
+        return self.MARCAS.get(perfil)
 
     def _pagina(self):
         html = PAGINA
@@ -3271,7 +3725,15 @@ class Handler(BaseHTTPRequestHandler):
             html = (html.replace("<title>Cacho</title>", "<title>%s</title>" % m["nombre"])
                         .replace('content="Cacho"', 'content="%s"' % m["nombre"])
                         .replace('href="/static/cacho.png"', 'href="/static/%s"' % m["cara"])
-                        .replace("<body>", '<body class="perfil-%s">' % (
+                        # `jaula` además del perfil (21-set-2026): lo que se esconde a quien no
+                        # es el usuario se esconde por ESA clase, una sola vez, y una jaula nueva
+                        # (la Constructora) nace ya limpia sin tocar el CSS.
+                        # RAÍZ (21-set-2026): hasta hoy se reemplazaba el PRIMER «<body>» del
+                        # archivo, y el primero está adentro de un comentario del CSS («…desde
+                        # <body> y los títulos…»): la clase del perfil nunca llegó al body de
+                        # verdad, y Administración veía el Cacho trotando y el tacómetro. El tag
+                        # real es el único que está solo en su línea.
+                        .replace("\n<body>\n", '\n<body class="perfil-%s jaula">\n' % (
                             (_sesion_valida(self._cookie("cacho_sesion")) or {}).get("perfil")), 1))
         cuerpo, enc = self._comprimir(html.encode())
         self.send_response(200)
@@ -3291,7 +3753,7 @@ class Handler(BaseHTTPRequestHandler):
         destino = u.path + ("?" + urlencode(q, doseq=True) if q else "")
         self.send_response(303)
         self.send_header("Location", destino or "/")
-        self.send_header("Set-Cookie", self._COOKIE_SESION.format(tok=tok))
+        self.send_header("Set-Cookie", self._cookie_sesion(tok))
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -3320,15 +3782,19 @@ class Handler(BaseHTTPRequestHandler):
             # Vienen del link de un WhatsApp de la casa (`?de=xara`, `?de=eterna`): la puerta
             # se llama como su asistente. El `de` viaja en el form para que un PIN equivocado
             # no vuelva a una pantalla que dice «Cacho».
-            m = self.MARCAS[perfil_de]
+            m = cacho_perfiles.marca(perfil_de) if cacho_perfiles else self.MARCAS[perfil_de]
             html = (html.replace("<title>Cacho</title>", "<title>%s</title>" % m["nombre"])
                         .replace('content="Cacho"', 'content="%s"' % m["nombre"])
+                        # El icono de la pantalla de inicio: sin sesion todavia, la cara la
+                        # dice el `?de=` (si no, guardar desde la puerta deja la de Cacho).
+                        .replace('href="/apple-touch-icon.png"',
+                                 'href="/static/%s"' % m["cara"])
                         .replace('<img src="/static/cacho.png" alt="">',
                                  '<img src="/static/%s" alt="">' % m["cara"])
                         .replace("<h1>Cacho</h1>", "<h1>%s</h1>" % m["nombre"])
                         .replace("<p>PIN de esta máquina (está en ~/.cacho_pin)</p>",
-                                 "<p>Tu PIN, el mismo del panel</p>"
-                                 '<input type="hidden" name="de" value="%s">' % de))
+                                 "<p>%s</p>" % m.get("pin", "Tu PIN, el mismo del panel")
+                                 + '<input type="hidden" name="de" value="%s">' % de))
         cuerpo, enc = self._comprimir(html.encode())
         self.send_response(403 if error else 401)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -3363,7 +3829,11 @@ class Handler(BaseHTTPRequestHandler):
     # o sea, material del negocio servido a cualquiera que llegue al puerto, sin
     # autenticarse. Ahora solo pasa el logo —que lo necesita la propia pantalla del
     # PIN— y el ping, que el lanzador usa como healthcheck y no dice nada de nadie.
-    _SIN_PIN = {"/api/ping", "/static/cacho.png"}
+    # Lo público SIN sesión: el ping y las CARAS que muestra la pantalla del PIN — la de Cacho
+    # y la de cada marca (Xara, Eterna…), derivadas de MARCAS. Hasta el 20-set-2026 sólo
+    # cacho.png estaba acá: al abrir /?de=xara sin sesión, xara.png contestaba 401 y la cara
+    # salía rota (Policía sobre 87517406). Una marca nueva entra sola.
+    _SIN_PIN = {"/api/ping", "/static/cacho.png"} | {"/static/%s" % m["cara"] for m in MARCAS.values() if m.get("cara")}
 
     def do_GET(self):
         self._login = None     # la identidad es de ESTA request (keep-alive reusa el handler)
@@ -3404,6 +3874,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(estado_general(self._quien(), self._perfil()))
             except Exception as e:
                 self._json({"error": repr(e)}, 500)
+        elif ruta == "/api/tablero":
+            # El tablero de la Constructora: lo pide SU ventana y no lo ve nadie más.
+            if self._perfil() != cacho_perfiles.CONSTRUCTORA:
+                return self._json({"error": "sólo la Constructora"}, 403)
+            self._json(tablero_constructora("fresco=1" in (urlparse(self.path).query or "")))
         elif ruta == "/api/ram":
             if self._quien() != "duenio":
                 return self._json({"error": "sólo el usuario"}, 403)
@@ -3794,7 +4269,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
     def _icono_ios(self):
-        p = os.path.join(AQUI, "static", "cacho.png")
+        """El icono que queda en la pantalla de inicio del telefono — el de SU ventana.
+
+        RAIZ: el nombre de la app ya seguia al perfil (`_pagina` reemplaza el `<title>` y el
+        `apple-mobile-web-app-title`), pero el icono era `cacho.png` siempre. Quien guardaba una
+        ventana de OTRA marca se quedaba con el nombre de esa marca y la cara de Cacho. La cara
+        sale de `_marca()`, o sea de la cookie de ESTA persona; sin sesion (la puerta del PIN)
+        sigue siendo la de Cacho."""
+        m = self._marca() or {}
+        cara = m.get("cara") or "cacho.png"
+        p = os.path.join(AQUI, "static", cara)
+        if not os.path.isfile(p):
+            p = os.path.join(AQUI, "static", "cacho.png")
         if not os.path.isfile(p):
             return self._json({"error": "no existe"}, 404)
         with open(p, "rb") as fh:
@@ -3803,6 +4289,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "image/png")
         self.send_header("Content-Length", str(len(cuerpo)))
         self.send_header("Cache-Control", "max-age=86400")
+        # `Vary: Cookie`: el icono depende de quien pide. Sin esto un proxy (o el propio
+        # navegador compartido) puede servirle a uno el icono cacheado del otro.
+        self.send_header("Vary", "Cookie")
         self.end_headers()
         self.wfile.write(cuerpo)
 
@@ -3838,10 +4327,13 @@ class Handler(BaseHTTPRequestHandler):
             if espera:
                 return self._bloqueo(espera)
             datos = parse_qs(self._body().decode("utf-8", "replace"))
-            if not (self._adentro() or _pin_igual(datos.get("pin", [""])[0])):
-                _fallo_pin(self._ip)
-                return self._json({"error": "falta el PIN"}, 403)
-            _acierto_pin(self._ip)
+            if not self._adentro():
+                espera = _reservar_intento(self._ip)      # atómico, DESPUÉS del cuerpo
+                if espera:
+                    return self._bloqueo(espera)
+                if not _pin_igual(datos.get("pin", [""])[0]):
+                    return self._json({"error": "falta el PIN"}, 403)
+                _acierto_pin(self._ip)
             return self._json({"t": _ticket_nuevo(), "vida_seg": TICKET_VIDA})
 
         if ruta == "/pin":
@@ -3849,6 +4341,9 @@ class Handler(BaseHTTPRequestHandler):
             if espera:
                 return self._bloqueo(espera)
             datos = parse_qs(self._body().decode("utf-8", "replace"))
+            espera = _reservar_intento(self._ip)          # atómico, DESPUÉS del cuerpo
+            if espera:
+                return self._bloqueo(espera)
             perfil, quien = _quien_es(datos.get("pin", [""])[0])
             if perfil:
                 _acierto_pin(self._ip)
@@ -3862,12 +4357,10 @@ class Handler(BaseHTTPRequestHandler):
                 destino = "/" + ("#c=" + charla if charla and _CHARLA_OK.match(charla) else "")
                 self.send_response(303)
                 self.send_header("Location", destino)
-                self.send_header("Set-Cookie", self._COOKIE_SESION.format(
-                    tok=_sesion_nueva(perfil, quien)))
+                self.send_header("Set-Cookie", self._cookie_sesion(_sesion_nueva(perfil, quien)))
                 self.send_header("Content-Length", "0")
                 self.end_headers()
             else:
-                _fallo_pin(self._ip)
                 self._pagina_pin(error=True, de=datos.get("de", [""])[0])
             return
 
@@ -4025,15 +4518,15 @@ class Handler(BaseHTTPRequestHandler):
             # son cosmética de la barra; un 429 a una rutina de producción pesa
             # más). Recién si hay MAX_TABS realmente VIVAS, el 429 es legítimo.
             _cosechar_tabs(time.time())
-            with TABS_LOCK:
-                lleno = len(TABS) >= MAX_TABS
-            if lleno:
+            if _lugar_para(self._perfil(), self._quien()):
                 _cosechar_tabs(time.time(), gracia=0)
-            with TABS_LOCK:
-                if len(TABS) >= MAX_TABS:
-                    return self._json(
-                        {"error": f"ya hay {MAX_TABS} pestañas abiertas; "
-                                  "cerrá alguna con la ✕"}, 429)
+            sin_lugar = _lugar_para(self._perfil(), self._quien())
+            if sin_lugar:
+                # Quién se quedó sin lugar y por qué cupo: sin esto, un 429 a una rutina
+                # de producción es un renglón mudo en el log (29-ago-2026).
+                print("⚠️ sin lugar para %s (%s): %s" % (
+                    self._quien() or "duenio", self._perfil() or "duenio", sin_lugar), file=sys.stderr)
+                return self._json({"error": sin_lugar}, 429)
             # modelo explícito para esta pestaña (lo usa citas_cacho para las premium).
             # Se valida acá con la misma vara que ~/.cacho_modelo: termina en un comando.
             modelo = q.get("modelo", [""])[0]
@@ -4076,6 +4569,18 @@ class Handler(BaseHTTPRequestHandler):
             # `pendiente`: la persona tocó una tarjeta de SUS pendientes (pendientes_admin). La
             # charla y el pedido salen del pendiente, no del cliente; y queda «en curso».
             pedido = ""
+            # `primer`: el mensaje que la persona ya escribió en el compositor cuando no
+            # tenía ninguna conversación abierta (WhatsApp: escribís y mandás, ver
+            # TermSession._primer_mensaje). Va en el CUERPO y no en la query porque es
+            # texto libre y largo. Es el texto de quien ya pasó la puerta — vale también
+            # en una jaula: es lo que iba a tipear igual.
+            try:
+                crudo = self._body()
+                if crudo:
+                    pedido = (json.loads(crudo.decode("utf-8", "replace")) or {}).get("primer") or ""
+            except (ValueError, TypeError, AttributeError):
+                pedido = ""
+            pedido = pedido.strip()[:4000] if isinstance(pedido, str) else ""
             pend = q.get("pendiente", [""])[0]
             if pend:
                 if not jaula or pendientes_admin is None:
@@ -4091,8 +4596,22 @@ class Handler(BaseHTTPRequestHandler):
                 abierta = _pestana_de_charla(quien, charla)
                 if abierta:
                     if pend:
-                        pendientes_admin.en_curso(quien, pend, abierta.id)
+                        # La pestaña ya está: el pedido de ESTA tarjeta se le tipea igual (ver
+                        # TermSession.tipear_pedido), y la marca de «tocado» va después de que
+                        # entró, en el mismo hilo, por la misma razón que abajo.
+                        threading.Thread(
+                            target=abierta.tipear_pedido, daemon=True,
+                            args=(pedido, lambda: pendientes_admin.en_curso(quien, pend, abierta.id))
+                        ).start()
                     return self._json({"id": abierta.id, "existente": True})
+                if not resume:
+                    # Su charla está dormida (la cerró el autocierre por inactividad): se
+                    # RETOMA, no se empieza de cero. Sin esto, el ahorro de cupo se lo
+                    # pagaba la persona contándole todo otra vez a Xara (22-set-2026).
+                    resume = _charla_dormida(quien, charla)
+                    if resume:
+                        print("charla %s: retomo la dormida %s de %s" % (
+                            charla, resume[:8], quien or "duenio"), file=sys.stderr)
                 if not area:
                     area = "xara"    # el usuario abriendo el link de ellas: es una charla de Xara
             # ── SIN ÁREA NO NACE (18-set-2026, plan «optimización del contexto», tanda 1, D9) ──
@@ -4120,14 +4639,38 @@ class Handler(BaseHTTPRequestHandler):
             elif not area:
                 return self._json({"error": "falta el área: ¿de quién es esta pestaña? "
                                             "(cacho, carla, jaime, eterna, waldemar, xara, ferguson…)"}, 400)
+            # ── El NACIMIENTO deja rastro (21-set-2026) ──────────────────────────────────
+            # el usuario: «se están disparando sesiones solas». Una pestaña nació a las 09:20 sin
+            # pedido y nadie pudo decir de dónde: el ✕ queda anotado desde el 17-set (quién,
+            # desde dónde, con qué navegador) pero el nacimiento no dejaba NADA. RAÍZ: la
+            # misma que la del ✕ — el único camino que crea una pestaña no escribía. Ahora
+            # cada nacimiento queda en el log con quién/desde dónde/cómo, y el `origen` se
+            # guarda en la meta de la charla para que el renglón lo muestre («nació 09:20 ·
+            # tocaste la cara de Cacho · iPhone»). `por` lo declara el cliente: la UI dice
+            # qué botón fue (cara, ＋, paleta, link de un WhatsApp, pendiente, retomar) y
+            # `cacho_lanzar` dice qué script lo llamó (`script:<nombre>`). No es seguridad,
+            # es trazabilidad: quien puede crear la pestaña ya pasó la puerta.
+            por = q.get("por", [""])[0][:80]
+            if por and not re.fullmatch(r"[A-Za-z0-9 _.:/+-]{1,80}", por):
+                por = "?"
+            origen = _origen_nacimiento(por or ("retomar" if resume else "?"), quien, self._ip,
+                                        self.headers.get("User-Agent") or "")
             t = TermSession(cwd, resume_id=resume, modelo=modelo, area=area, jaula=jaula,
                             charla=charla, pedido=pedido, conectores=() if jaula else conectores)
+            print("✚ pestaña %s (historial %s, área %s) nació: %s" % (
+                t.id, t.transcript_id or "-", area or "-", _origen_en_criollo(origen, con_hora=True)),
+                file=sys.stderr)
             if pend:
                 # La marca la pone el SERVER en el mismo paso que abre la pestaña (misma razón
                 # que en el monitor del usuario): si el JS encadenara otro fetch, un error de red
                 # dejaría la tarjeta arriba con la sesión ya abierta, y la tocaría de nuevo.
                 pendientes_admin.en_curso(quien, pend, t.id)
             campos = {}
+            # Al RETOMAR una charla vieja, el nacimiento es el de la charla, no el de esta
+            # pestaña: se conserva el origen anotado (si lo tenía); una charla vieja sin
+            # origen lo recibe recién ahora, y dice «retomada».
+            if not (resume and (_meta_leer().get(resume) or {}).get("origen")):
+                campos["origen"] = origen
             if area:
                 campos["area"] = area
             if charla:
@@ -4320,7 +4863,8 @@ PAGINA_PIN = r"""<!doctype html>
     <img src="/static/cacho.png" alt="">
     <h1>Cacho</h1>
     <p>PIN de esta máquina (está en ~/.cacho_pin)</p>
-    <input name="pin" inputmode="numeric" autocomplete="one-time-code" autofocus>
+    <input name="pin" inputmode="numeric" autocomplete="one-time-code" autofocus
+           maxlength="64">
     <input type="hidden" name="charla" value="">
     <button>Entrar</button>
     {{AVISO}}
@@ -4328,9 +4872,24 @@ PAGINA_PIN = r"""<!doctype html>
   <script>
   // El link de un WhatsApp de la casa trae `#c=<charla>`; el fragmento no viaja en el POST
   // del PIN, así que se copia acá y el server lo devuelve en la URL de entrada.
+  //
+  // Y el del LEGADO trae `#k=<llave>` (22-set-2026). el usuario: «no quiero claves ni nada de eso…
+  // que le llegue un enlace y que le diga: acá está el usuario, hablale». Entonces la llave viene
+  // adentro del link y la pantalla se saltea sola: su hija abre el link y ya está hablando.
+  // Va en el FRAGMENTO y no en `?pin=` a propósito: el fragmento no viaja al servidor, así
+  // que la llave no queda escrita en ningún log ni se la lleva un referrer.
   (function(){
-    var m = /^#c=([0-9a-f-]{8,40})$/.exec(location.hash || "");
-    if(m) document.querySelector('input[name="charla"]').value = m[1];
+    var h = location.hash || "";
+    var c = /[#&]c=([0-9a-f-]{8,40})/.exec(h);
+    if(c) document.querySelector('input[name="charla"]').value = c[1];
+    var k = /[#&]k=([A-Za-z0-9_-]{16,64})/.exec(h);
+    if(k){
+      var caja = document.querySelector('input[name="pin"]');
+      caja.value = k[1];
+      caja.type = "hidden";                       // que no se vea la llave en la pantalla
+      history.replaceState(null, "", location.pathname + location.search);
+      document.querySelector('form').submit();    // entra solo: no hay nada que tipear
+    }
   })();
   </script>
 </body>
@@ -4698,8 +5257,69 @@ body.area-fija .item .cara-ar{display:none}
 /* La sesión de Flo/Karen/Xime en la barra del usuario: se ve, atenuada, con su nombre; no se abre. */
 .item.ajena{opacity:.72;cursor:default;border-left-style:dashed}
 .item.ajena .de-quien{font-weight:600;color:#7d766a}
-/* Administración ve la ventana de XARA y Supervisión la de ETERNA: el Cacho que corre al pie de la tira no es de ellas. */
-body.perfil-administracion #corriendo, body.perfil-supervision #corriendo{display:none !important}
+/* Una JAULA (Administración → Xara, Supervisión → Eterna, la Constructora) es la ventana de
+   Cacho con otra cara, y lo que es de la casa no se le muestra (el usuario, 21-set-2026, foto de la
+   laptop de Administración): los medidores de uso de los modelos, el tacómetro de RAM,
+   Creativos, el ⚙, el contador de pestañas, el cambio de modo de la terminal y el Cacho
+   que corre al pie de la tira. Lo que decide es `body.jaula` (lo pone el server). */
+body.jaula #corriendo, body.jaula #uso, body.jaula #tacometro, body.jaula #btn-conf,
+body.jaula #charla-cabecera a[href="/creativos"], body.jaula #pie, body.jaula #btn-modo,
+body.jaula #ir-robert{display:none !important}
+/* ── El TABLERO DE LA OBRA (Constructora, 22-set-2026) ────────────────────────
+   Va ARRIBA de la charla y no en una pantalla aparte: el Negro entra a ver cuánta plata
+   lleva gastada Y a preguntarle a Guayabo en el mismo lugar (mismo criterio que el tablero
+   de Xara, 29-ago-2026). Las tarjetas NO están escritas acá: las arma `tools/tablero.py`
+   en la casa de ellos y las edita Guayabo cuando el Negro pide ver algo nuevo — por eso
+   esto pinta formas genéricas (número, barras, tabla, lista) y no «compras» ni «unidades».
+   Tope duro de alto: es un encabezado, no una pantalla; si se come la charla deja de servir. */
+#tablero-obra{flex:0 0 auto; border-bottom:1px solid var(--borde); background:var(--panel)}
+#tob-cab{display:flex; align-items:center; gap:10px; padding:9px 16px; cursor:pointer;
+  font-size:13px; color:var(--gris); user-select:none}
+#tob-cab b{color:var(--tinta); font-size:13.5px; font-family:var(--display); letter-spacing:.2px}
+#tob-cab .fl{margin-left:auto; font-size:11px}
+/* GRILLA y no flex-wrap: con `flex:1 1 210px` una tarjeta que queda sola en su renglón se
+   estira hasta el ancho entero y el tablero se lee como una lista de siete renglones gordos.
+   Con columnas de ancho fijo, cada tarjeta ocupa lo suyo y se comparan de un vistazo. */
+#tob-cuerpo{padding:0 16px 12px; display:grid; gap:12px 22px; align-items:start;
+  grid-template-columns:repeat(auto-fill, minmax(235px, 1fr));
+  max-height:38vh; overflow-y:auto; scrollbar-width:thin}
+/* Siete tarjetas no entran arriba de una charla usable, así que el tablero SCROLLEA. Con la
+   barra oculta de macOS el corte se lee como un tablero roto: el último renglón queda partido
+   al medio y no hay nada que diga que abajo hay más. Dos avisos, entonces — la barra fina, y
+   el degradé al pie cuando efectivamente sobra contenido (`hay-mas`, lo pone el pintor). */
+#tob-cuerpo::-webkit-scrollbar{width:9px}
+#tob-cuerpo::-webkit-scrollbar-thumb{background:#d6d2c4; border-radius:5px; border:2px solid var(--panel)}
+#tob-cuerpo.hay-mas{-webkit-mask-image:linear-gradient(to bottom, #000 calc(100% - 22px), transparent);
+  mask-image:linear-gradient(to bottom, #000 calc(100% - 22px), transparent)}
+#tablero-obra.plegado #tob-cuerpo{display:none}
+.tob{min-width:0}
+.tob.ancho{grid-column:1 / -1}
+.tob h4{margin:0 0 5px; font-size:11px; letter-spacing:.6px; text-transform:uppercase;
+  color:var(--gris); font-weight:700}
+.tob .grande{font-size:20px; font-weight:700; letter-spacing:-.3px; line-height:1.2; color:var(--tinta)}
+.tob .sub{font-size:11.5px; color:var(--gris); margin-top:2px}
+.tob .nada{font-size:12px; color:var(--gris); font-style:italic}
+.tob .mal{font-size:12px; color:var(--acento)}
+/* LÍNEA · TUBO: cada renglón es un nombre a la izquierda, el número a la derecha y abajo el
+   tubo con lo que le toca del total. Se lee sin leer: la barra más larga es dónde se va la
+   plata. Nada de tortas ni de leyendas de colores. */
+.tob .ren{margin-bottom:6px}
+.tob .ren .l{display:flex; gap:8px; font-size:12.5px; line-height:1.35; color:var(--tinta)}
+.tob .ren .l .n{flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.tob .ren .l .v{font-weight:700; white-space:nowrap}
+.tob .ren .l .d{color:var(--gris); font-size:11px; white-space:nowrap}
+.tob .tubo{height:5px; border-radius:3px; background:var(--borde); margin-top:3px; overflow:hidden}
+.tob .tubo i{display:block; height:100%; background:var(--acento); border-radius:3px}
+.tob .tubo.frio i{background:var(--aca)}
+/* En el celular el renglón se PARTE en dos: arriba el nombre y el número, abajo el detalle.
+   En una sola línea el nombre se comía en puntitos («Contenedo…») justo lo único que
+   identifica la fila. */
+@media(max-width:760px){
+  #tob-cab{padding:10px 12px}
+  #tob-cuerpo{padding:0 12px 12px; max-height:42vh; grid-template-columns:1fr}
+  .tob .ren .l{flex-wrap:wrap}
+  .tob .ren .l .d{flex:1 1 100%}
+}
 #corriendo{
   display:none; position:relative; flex:none; height:44px; width:100%;
   margin-top:6px; padding-top:6px; border-top:1px solid var(--borde);
@@ -4818,6 +5438,14 @@ body.perfil-administracion #corriendo, body.perfil-supervision #corriendo{displa
   align-items:center; justify-content:center; color:var(--gris);
   font-family:var(--display); font-size:17px;
 }
+#vacio img{width:84px; height:84px; border-radius:50%; object-fit:cover}
+#vacio #btn-arrancar{
+  margin-top:4px; border:0; background:var(--acento); color:#fff; border-radius:999px;
+  padding:11px 22px; font:600 15px/1 var(--display), system-ui, sans-serif; cursor:pointer;
+  box-shadow:0 2px 10px rgba(0,0,0,.25);
+}
+#vacio #btn-arrancar:hover{filter:brightness(1.08)}
+#vacio #btn-arrancar:disabled{opacity:.55; cursor:default}
 /* ---------- visor de solo-lectura (automáticas / terminadas) ---------- */
 .ver-box{
   position:absolute; inset:14px; background:var(--card); border:1px solid var(--borde);
@@ -5129,7 +5757,7 @@ body.perfil-administracion #corriendo, body.perfil-supervision #corriendo{displa
   font-family:inherit; margin-left:4px;
 }
 </style>
-<link rel="stylesheet" href="/static/cacho-interfaz.css?v=20260919-6">
+<link rel="stylesheet" href="/static/cacho-interfaz.css?v=20260922-1">
 </head>
 <body>
 <div id="barra-m">
@@ -5184,17 +5812,31 @@ body.perfil-administracion #corriendo, body.perfil-supervision #corriendo{displa
     <section id="conf-cuerpo"><h3>Configuración</h3><p class="desc">cargando…</p></section>
   </div>
   <!-- UNA sola fila arriba (el usuario, 19-set-2026: «me quedo apretado para leer»): el equipo a la
-       izquierda y, en la misma línea, el título de la charla, el tacómetro de RAM, Creativos,
+       izquierda y, en la misma línea, el título de la charla, el tacómetro de RAM
        el logo con la bandera y el ⚙. En el celular #arriba se apila (dos filas, como antes). -->
   <div id="arriba">
   <div id="tira-caras" role="group" aria-label="El equipo"></div>
-  <header id="charla-cabecera"><div><strong id="charla-titulo">Tu oficina</strong><span id="charla-estado"></span></div><span id="tacometro" hidden></span><a href="/creativos" target="_blank" rel="noopener">Creativos ↗</a><button id="btn-conf" title="Configuración" aria-label="Configuración"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.56-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h0a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v0a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.56 1.03z"/></svg></button></header>
+  <!-- ROBERT K. de un clic (el usuario, 22-set-2026: «al lado de la carita de Cacho, con su
+       carita, para entrar de un clic»). Es el panel de su plata PERSONAL, que vive en OTRA
+       máquina: lo publica `tailscale serve --https=8445` desde la mini (robert/panel.py:6,
+       puerto en robert/config.py) y nunca sale por Funnel. Por eso el link es absoluto y no
+       `location.hostname`: Cacho corre en la Studio y el panel no está acá.
+       En una JAULA no se muestra (`body.jaula #ir-robert{display:none}`): la ventana es la
+       misma para Administración, Supervisión y la Constructora, y la plata del usuario no es
+       de ellas — la promesa «esto lo uso sólo yo» vale para SU ventana, no para el código. -->
+  <header id="charla-cabecera"><div><strong id="charla-titulo">Tu oficina</strong><span id="charla-estado"></span></div><span id="tacometro" hidden></span><button id="btn-conf" title="Configuración" aria-label="Configuración"><svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1.03 1.56V21a2 2 0 1 1-4 0v-.09a1.7 1.7 0 0 0-1.11-1.56 1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.7 1.7 0 0 0 .34-1.87 1.7 1.7 0 0 0-1.56-1.03H3a2 2 0 1 1 0-4h.09a1.7 1.7 0 0 0 1.56-1.11 1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.7 1.7 0 0 0 1.87.34h0a1.7 1.7 0 0 0 1.03-1.56V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1.03 1.56 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.7 1.7 0 0 0-.34 1.87v0a1.7 1.7 0 0 0 1.56 1.03H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.56 1.03z"/></svg></button></header>
   </div>
   <!-- El RENGLÓN de la charla (el usuario, 20-set-2026: «abajo de las caras, antes del recuadro
        negro, un renglón de lado a lado con el título de la sesión y un pequeño resumen»):
        título + el mismo mini resumen del costado, en letra chica. Sólo escritorio: en el
        celular el título vive en la cabecera. -->
   <div id="charla-linea"><strong id="cl-tit">Tu oficina</strong><span id="cl-res">Elegí una conversación</span></div>
+  <!-- El tablero de la obra. Sólo lo ve la Constructora (`body.perfil-constructora`, lo pone
+       el server): son los números de OTRA empresa y en la ventana del usuario no pintan nada. -->
+  <div id="tablero-obra" hidden>
+    <div id="tob-cab"><b>📊 La obra</b><span id="tob-res">cargando…</span><span class="fl" id="tob-fl">▾</span></div>
+    <div id="tob-cuerpo"></div>
+  </div>
   <div id="conexion-estado" role="status" hidden></div>
   <div id="tarjeta">
     <div class="th"><span class="t" id="tj-tit"></span><small id="tj-sub"></small><button class="x" id="tj-x" title="Cerrar">✕</button></div>
@@ -5209,7 +5851,13 @@ body.perfil-administracion #corriendo, body.perfil-supervision #corriendo{displa
     </div>
   </div>
   <div id="terms">
-    <div id="vacio"><img src="/static/cacho.png" style="width:84px;height:84px;border-radius:50%">Abrí una sesión nueva o elegí una de la izquierda.</div>
+    <!-- La pantalla de ANTES de la primera conversación (el usuario, 22-set-2026, con la ventana de
+         la Constructora en el teléfono: «cómo empieza una conversación… lo más parecido a
+         WhatsApp posible»). El ＋ vive en el cajón, o sea escondido en el celular: acá va el
+         botón, al medio de la pantalla, y abajo el campo ya escribe (ver pintarCompositor). -->
+    <div id="vacio"><img id="cara-vacio" src="/static/cacho.png" alt="">
+      <span id="vacio-txt">Escribí abajo y arrancamos.</span>
+      <button id="btn-arrancar">Empezar una conversación</button></div>
     <button id="btn-mic" title="Dictar por micrófono"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg></button>
     <button id="btn-enviar-esc" title="Enviar (Enter en la sesión activa)"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg></button>
     <div id="mic-live"></div>
@@ -5829,7 +6477,11 @@ const ESPERA_NUEVA = 1500;   // ms entre creaciones desde la interfaz
 // siempre. Va en la URL y no como cuerpo porque el server ya lee todo de la query.
 // `charla`: el `#c=<id>` del link de un WhatsApp de la casa (ver abrirAviso): la pestaña nace
 // con esa charla abierta, o se vuelve a la que ya la tiene.
-async function nueva(cwd, area, charla, pendiente){
+// `por`: QUÉ botón la abre (cara, mas, paleta, aviso, pendiente, nueva-pesada). Va al server,
+// que lo anota al nacer: es lo que después contesta «¿quién abrió esta sesión?» (21-set-2026).
+// `primer`: el mensaje que la persona YA escribió (compositor sin conversación abierta).
+// Viaja en el cuerpo y lo tipea el server cuando el TUI está listo (_primer_mensaje).
+async function nueva(cwd, area, charla, pendiente, por, primer){
   if(creandoSesion || Date.now() - ultimaSesionCreada < ESPERA_NUEVA){
     // decirlo, no ignorar en silencio: si de verdad querías dos, en un segundo podés
     aviso("Esperá, ya estoy creando una sesión…");
@@ -5848,12 +6500,18 @@ async function nueva(cwd, area, charla, pendiente){
     const r = await fetch("/api/term/new?cwd=" + encodeURIComponent(cwd)
                           + (area ? "&area=" + encodeURIComponent(area) : "")
                           + (charla ? "&charla=" + encodeURIComponent(charla) : "")
-                          + (pendiente ? "&pendiente=" + encodeURIComponent(pendiente) : ""),
-                          {method:"POST"});
+                          + (pendiente ? "&pendiente=" + encodeURIComponent(pendiente) : "")
+                          + (por ? "&por=" + encodeURIComponent(por) : ""),
+                          {method:"POST", body: primer ? JSON.stringify({primer:primer}) : ""});
     const j = await r.json();
     if(!j.id) throw new Error(j.error || ("HTTP " + r.status));
     await refrescar(); abrirTab(j.id);
-    aviso(j.existente ? "Esa charla ya estaba abierta acá" : "");
+    // Decir que NACIÓ una y por qué (21-set-2026, «se disparan sesiones solas»): tocar una
+    // cara sin sesión viva crea una (regla del 19-set) y eso, mudo, parece un fantasma.
+    const ai = areaInfo(area || "");
+    aviso(j.existente ? "Esa charla ya estaba abierta acá"
+        : por === "cara" ? "Nació una sesión nueva con " + (ai ? ai.nombre : "Cacho") + ": no tenía ninguna viva"
+        : "");
     return j.id;
   }catch(err){
     aviso("No pude crear la sesión: " + err.message, true);
@@ -5942,7 +6600,7 @@ async function retomarSid(sid){
     // El área la pone lo que el usuario DECLARÓ para ese sid (el server la lee de la meta);
     // esto es sólo el respaldo para una charla vieja sin área, que si no rebota con 400.
     const respaldo = areaActiva || estado.area_defecto || "";
-    const r = await fetch("/api/term/new?resume=" + sid
+    const r = await fetch("/api/term/new?por=retomar&resume=" + sid
                           + (respaldo ? "&area=" + encodeURIComponent(respaldo) : ""), {method:"POST"});
     const j = await r.json();
     if(!j.id) throw new Error(j.error || "?");
@@ -6015,7 +6673,9 @@ async function pintarVer(){
 function resumenDe(o){
   const mismo = (a, b) => { a = String(a||"").toLowerCase(); b = String(b||"").toLowerCase();
                             return a && b && (a.startsWith(b.slice(0, 40)) || b.startsWith(a.slice(0, 40))); };
-  return (o.pedido && !mismo(o.pedido, o.titulo)) ? o.pedido : (o.contexto || "");
+  // Una sesión que todavía no dice nada muestra CÓMO nació («nació 09:20 · tocaste la cara
+  // · iPhone»): es la respuesta a «¿y ésta quién la abrió?» sin tener que preguntarlo.
+  return (o.pedido && !mismo(o.pedido, o.titulo)) ? o.pedido : (o.contexto || o.origen || "");
 }
 function itemHTML(o, attrs, opts){
   opts = opts || {};
@@ -6033,7 +6693,7 @@ function itemHTML(o, attrs, opts){
   // Lo que antes iba en letras chicas abajo (contexto, pedido, proyecto) vive acá:
   // se lee posando el mouse, y el buscador lo sigue encontrando (textoDe).
   const tip = [o.titulo, o.tema ? "tema: "+o.tema+(mutó?" (arrancó en "+o.tema_ini+")":"") : "",
-               o.contexto, o.pedido ? "⟶ " + o.pedido : "", o.proyecto]
+               o.contexto, o.pedido ? "⟶ " + o.pedido : "", o.origen, o.proyecto]
               .filter(Boolean).join("\n");
   const ar = areaDe(o), arI = areaInfo(ar);
   // La sesión de una persona de Administración en SU ventana: se ve, no se toca.
@@ -6072,7 +6732,7 @@ function itemHTML(o, attrs, opts){
           <span style="flex:1"></span>${acciones}${opts.botonX||""}</div>
         ${o.peso==="rojo"&&opts.activo?'<div class="peso-aviso"><span>'+esc(o.peso_nota)
           +'</span><button onclick="event.stopPropagation();nueva('+JSON.stringify(o.cwd||"")
-          +')">Nueva</button></div>':""}
+          +',\'\',\'\',\'\',\'nueva-pesada\')">Nueva</button></div>':""}
         </div>
       </div>`;
 }
@@ -6169,16 +6829,18 @@ function abrirLaQueEspera(area){
   if(!elegida && !mias.some(t => t.id === activa))
     elegida = otras.slice().sort((a, b) => a.hace_seg - b.hace_seg)[0];
   if(elegida){ abrirTab(elegida.id); return; }
-  if(!mias.length) nuevaCon(area);
+  if(!mias.length) nuevaCon(area, "cara");
 }
 /* Nueva sesión con un agente (el ＋ del costado y el de la fila del equipo). El proyecto es el primero, salvo que el área declare el suyo (`proyecto` en areas.py: Robert K. vive en
    su carpeta, del otro lado de la pared). */
-function nuevaCon(area){
+function nuevaCon(area, por, primer){
   const ar = areaInfo(area || "");
   const quiero = (ar && ar.proyecto) || (estado.proyectos[0] || {}).nombre || "";
   const p = estado.proyectos.find(p => p.nombre.includes(quiero));
-  if(!p){ aviso("No encuentro la carpeta «" + quiero + "» en ~/Claude/Projects"); return; }
-  nueva(p.cwd, area || "");
+  // En una jaula la carpeta y el área las pone el SERVER (no el cliente): que la lista de
+  // proyectos no traiga la suya no puede dejar a la persona sin poder hablar.
+  if(!p && !enJaula()){ aviso("No encuentro la carpeta «" + quiero + "» en ~/Claude/Projects"); return; }
+  return nueva(p ? p.cwd : "", area || "", "", "", por || "mas", primer);
 }
 // Rueda del mouse (vertical) sobre la fila: es horizontal y sin trackpad no se mueve.
 $("#tira-caras").addEventListener("wheel", e => {
@@ -6214,6 +6876,13 @@ function pintarMarcoArea(){
   // El ✕ para salir del filtro va SÓLO cuando hay filtro: sin él no hay nada que salir.
   const tit = $("#tit-area");
   const ai = areaInfo(areaActiva || k || "");
+  if(enJaula()){
+    // En una jaula no hay «sesiones»: son SUS charlas con Xara/Eterna. Misma ventana,
+    // palabras de la persona (21-set-2026).
+    const f = $("#filtro"), av = $("#btn-avisos");
+    if(f) f.placeholder = "Buscar en tus charlas…";
+    if(av) av.textContent = "🔔 Avisarme cuando " + nombreCasa() + " conteste";
+  }
   if(tit){
     tit.textContent = ai ? ai.nombre : nombreCasa();
     tit.title = ai ? (ai.rol + " — le habla a " + ai.gente
@@ -6254,6 +6923,8 @@ function pintarMarcoArea(){
 /* Cómo se llama esta ventana para quien la mira: «Cacho» para el usuario; para Administración lo
    dice `estado.marca` (Xara). Ningún texto del front escribe «Cacho» a mano: pasa por acá. */
 function nombreCasa(){ return (estado && estado.marca && estado.marca.nombre) || "Cacho"; }
+/* ¿Esta ventana es una jaula (no es el usuario)? Lo dice el body, que lo escribe el server. */
+function enJaula(){ return document.body.classList.contains("jaula"); }
 
 /* Cambia una cara sólo si de verdad cambió: `render()` corre cada 4 s y reescribir el src
    idéntico reinicia la animación de "respira" del logo cuando hay trabajo. */
@@ -6568,7 +7239,7 @@ function pintarConf(){
       + fila("Carpeta de trabajo", "Dónde nacen las pestañas.", '<span class="val">' + esc(((estado.proyectos||[])[0]||{}).nombre || "") + '</span>')
       + '</div><div class="tarj">'
       + fila("Cerrar sola una sesión terminada", "Cuando la respuesta termina con «✓ Encargo completo.» y no queda nada por decidir.", '<span class="pill ok">activo</span>')
-      + fila("Tope de sesiones vivas", "Techo de pestañas a la vez en esta máquina.", '<span class="val">' + esc(m.max_tabs || "—") + '</span>')
+      + fila("Tope de sesiones vivas", "Techo de pestañas a la vez en esta máquina (sale de la RAM). De ese total, hasta " + esc(m.cupo_jaulas || "—") + " son de las áreas con ventana propia: el resto es tuyo.", '<span class="val">' + esc(m.max_tabs || "—") + '</span>')
       + fila("Terminadas: cuántas mostrar", "Las demás se buscan por su nombre.", '<span class="val">12 · buscando, 40</span>')
       + '</div><p class="nota">Lo de arriba es sólo lectura: se cambia en la casa, no desde acá.</p>';
   } else if(confSeccion === "areas"){
@@ -6655,7 +7326,7 @@ function tacometroSVG(pct, nivel){
 }
 async function pintarTacometro(){
   const el = $("#tacometro");
-  if(!el || document.body.classList.contains("perfil-administracion") || document.body.classList.contains("perfil-supervision")) return;
+  if(!el || enJaula()) return;
   try{
     const r = await fetch("/api/ram"); const d = await r.json();
     if(!d.ok){ el.hidden = true; return; }
@@ -6772,7 +7443,7 @@ document.addEventListener("click", e => {
   if(pd){
     // El server decide la charla y el pedido (salen del pendiente, no del cliente) y marca
     // «en curso» en el mismo paso que abre la pestaña.
-    nueva("", "", "", pd.dataset.pend);
+    nueva("", "", "", pd.dataset.pend, "pendiente");
     return;
   }
   const item = e.target.closest(".item");
@@ -6812,7 +7483,18 @@ document.addEventListener("click", e => {
     // pegado arriba del buscador, y si se queda con el foco cualquier Enter o barra
     // espaciadora posterior lo vuelve a disparar sin que nadie lo haya tocado.
     bg.blur();
-    nuevaCon(bg.dataset.nuevaEn || "");
+    nuevaCon(bg.dataset.nuevaEn || "", "mas");
+    return;
+  }
+  // El botón del medio de la pantalla vacía (22-set-2026): en el celular el ＋ vive en el
+  // cajón, o sea escondido. Si ya hay algo escrito, ESO arranca la charla; si no, nace
+  // vacía y el teclado queda abierto para escribir — los dos caminos terminan igual.
+  const ba = e.target.closest("#btn-arrancar");
+  if(ba){
+    ba.blur();
+    if($("#texto-m").value.trim()) arrancarConMensaje();
+    else Promise.resolve(nuevaCon(areaActiva || estado.area_defecto || "", "arrancar"))
+           .then(id => { if(id && !MOVIL) $("#texto-m").focus(); });
     return;
   }
 });
@@ -6844,7 +7526,9 @@ const borradores = new Map(), envios = new Set(), mensajesEnvio = new Map(), env
 let borradorClave = "";
 function claveBorrador(id){
   const t = estado.tabs.find(t => t.id === id);
-  return t ? String(t.duenio || "duenio") + ":" + (t.sid || t.id) : (id || "");
+  // Sin conversación abierta el borrador tiene clave igual («nuevo»): lo que escribiste
+  // antes de que naciera la charla no se puede perder (ver arrancarConMensaje).
+  return t ? String(t.duenio || "duenio") + ":" + (t.sid || t.id) : (id || "nuevo");
 }
 function leerBorrador(k){
   if(borradores.has(k)) return borradores.get(k);
@@ -6886,18 +7570,38 @@ function pintarCompositor(){
   const t = estado.tabs.find(t => t.id === activa);
   const nombre = (areaInfo(areaDe(t)) || {}).nombre || "la conversación";
   const habilitado = !!(activa && abiertas[activa] && t && t.viva);
-  $("#texto-m").disabled = !habilitado;
-  $("#texto-m").placeholder = habilitado ? "Escribile a " + nombre + "…" : "Abrí una conversación para escribir";
-  $("#btn-enviar").disabled = !habilitado || envios.has(borradorClave);
+  // ARRANQUE (22-set-2026): sin ninguna conversación abierta el campo NO se apaga. Escribís,
+  // mandás, y la charla NACE con tu mensaje adentro — como WhatsApp, donde nadie «abre una
+  // sesión» antes de hablar. El campo sólo queda mudo mirando una charla terminada o muerta,
+  // que es donde de verdad no hay a quién escribirle (ahí manda el botón «Retomar»).
+  const arranque = !habilitado && !activa;
+  const conQuien = arranque ? ((areaInfo(areaActiva || estado.area_defecto || "") || {}).nombre
+                               || nombreCasa()) : nombre;
+  $("#texto-m").disabled = !habilitado && !arranque;
+  $("#texto-m").placeholder = (habilitado || arranque) ? "Escribile a " + conQuien + "…"
+                                                      : "Abrí una conversación para escribir";
+  $("#btn-enviar").disabled = (!habilitado && !arranque) || envios.has(borradorClave);
   const pendiente = fallido(borradorClave);
   $("#recuperar-envio").hidden = !pendiente || pendiente === $("#texto-m").value || envios.has(borradorClave);
-  $("#btn-adj").disabled = !habilitado;
-  $("#btn-mic-m").disabled = !habilitado;
-  $("#envio-estado").textContent = mensajesEnvio.get(borradorClave) || (habilitado ? "Enter para enviar · Mayús + Enter para otra línea" : "");
-  $("#charla-titulo").textContent = t ? t.titulo : "Tu oficina";
-  $("#cl-tit").textContent = t ? t.titulo : "Tu oficina";
-  $("#cl-res").textContent = t ? resumenDe(t) : "Elegí una conversación";
-  $("#charla-estado").textContent = t ? nombre + " · " + (t.estado === "trabajando" ? "Trabajando" : t.te_espera ? "Respuesta lista" : t.viva ? "Disponible" : "Finalizada") : "Elegí una conversación";
+  $("#btn-adj").disabled = !habilitado;          // adjuntar necesita una conversación viva
+  $("#btn-mic-m").disabled = !habilitado && !arranque;
+  const ba = $("#btn-arrancar");
+  if(ba){
+    ba.disabled = envios.has(borradorClave);
+    ba.textContent = "Escribirle a " + conQuien;
+  }
+  const txtVacio = $("#vacio-txt");
+  if(txtVacio) txtVacio.textContent = "Escribí abajo y arrancamos.";
+  ponerCara("#cara-vacio", (areaInfo(areaActiva || estado.area_defecto || "") || {}).cara || null);
+  $("#envio-estado").textContent = mensajesEnvio.get(borradorClave)
+    || (arranque ? "Enter y arranca la conversación"
+       : habilitado ? "Enter para enviar · Mayús + Enter para otra línea" : "");
+  const vacioTit = arranque ? "Nueva conversación" : "Tu oficina";
+  const vacioRes = arranque ? "Escribile a " + conQuien : "Elegí una conversación";
+  $("#charla-titulo").textContent = t ? t.titulo : vacioTit;
+  $("#cl-tit").textContent = t ? t.titulo : vacioTit;
+  $("#cl-res").textContent = t ? resumenDe(t) : vacioRes;
+  $("#charla-estado").textContent = t ? nombre + " · " + (t.estado === "trabajando" ? "Trabajando" : t.te_espera ? "Respuesta lista" : t.viva ? "Disponible" : "Finalizada") : vacioRes;
   const ta = $("#texto-m"); ta.style.height = "auto"; ta.style.height = Math.min(ta.scrollHeight, 160) + "px";
 }
 function agregarAlBorrador(id, texto, k = claveBorrador(id)){
@@ -6924,9 +7628,42 @@ async function mandar(raw, siFalla, id = activa){
   try{ await escribirSesion(id, raw); return true; }
   catch(err){ aviso("No pude confirmar el envío. " + err.message, true); if(siFalla) siFalla(); return false; }
 }
+/* El arranque «WhatsApp» (22-set-2026): no hay ninguna conversación abierta y la persona
+   escribió igual. Nace una CON su mensaje adentro — el texto viaja con el nacimiento y lo
+   tipea el server cuando el TUI está listo (TermSession._primer_mensaje), que es lo único
+   que sabe cuándo se puede pegar sin que la pantalla de arranque se lo coma. El borrador se
+   conserva hasta que el server confirmó la pestaña: si falla, el texto sigue en el campo. */
+async function arrancarConMensaje(){
+  const k = borradorClave || "nuevo";
+  if(envios.has(k)) return;
+  if(micMParar) micMParar();
+  const ta = $("#texto-m");
+  ta.blur(); guardarBorrador();
+  envios.add(k); pintarCompositor();
+  await new Promise(r => setTimeout(r, 150));   // iOS confirma el dictado al perder foco
+  guardarBorrador();
+  const valor = leerBorrador(k);
+  if(!valor.trim()){ envios.delete(k); pintarCompositor(); return; }
+  fallido(k, valor);
+  mensajesEnvio.set(k, "Arrancando la conversación…"); pintarCompositor();
+  let id = "";
+  try{ id = await nuevaCon(areaActiva || estado.area_defecto || "", "escribir", valor); }
+  finally{ envios.delete(k); }
+  if(!id){
+    mensajesEnvio.set(k, "No pude arrancar la conversación. Tu texto quedó acá.");
+    pintarCompositor(); return;
+  }
+  // Entró: el borrador de «nuevo» se limpia y el aviso pasa a la charla que nació (la
+  // activa, que `nueva` ya abrió). El mensaje entra solo en cuanto Claude dibuje el prompt.
+  escribirBorrador(k, ""); fallido(k, null); mensajesEnvio.delete(k);
+  if(ta && claveBorrador(activa) !== k) ta.value = leerBorrador(claveBorrador(activa));
+  mensajesEnvio.set(claveBorrador(id), "Tu mensaje entra apenas abra la conversación");
+  pintarCompositor();
+}
 async function enviarTexto(){
   const id = activa, k = borradorClave;
-  if(!id || !abiertas[id]){ aviso("Abrí una conversación; tu texto no se envió", true); return; }
+  if(!id) return arrancarConMensaje();
+  if(!abiertas[id]){ aviso("Abrí una conversación; tu texto no se envió", true); return; }
   if(envios.has(k)) return;
   if(micMParar) micMParar();
   const ta = $("#texto-m");
@@ -7661,7 +8398,7 @@ function opcionesPaleta(q){
   // manage") también llegue acá, no solo tipear el nombre pelado del proyecto
   estado.proyectos.filter(p => casaCon("nueva sesión en " + p.nombre))
     .forEach(p => out.push({icono:"＋", qué:"Nueva sesión en " + p.nombre,
-                            dónde:"", estado:"", hacer:() => nueva(p.cwd)}));
+                            dónde:"", estado:"", hacer:() => nueva(p.cwd, "", "", "", "paleta")}));
   return out.slice(0, 40);
 }
 
@@ -7840,7 +8577,7 @@ function cerrarTarjeta(){
 function responderTarjeta(texto, conEnter){
   if(!activa || !abiertas[activa]){ aviso("Abrí la conversación para responder", true); return; }
   agregarAlBorrador(activa, texto);
-  aviso("Comentario listo para revisar y enviar. La aprobación de publicidad se hace en Creativos.");
+  aviso("Comentario listo para revisar y enviar.");
 }
 $("#tj-x").addEventListener("click", cerrarTarjeta);
 $("#tj-ok").addEventListener("click", () => { const t = tarjetas[sidActiva()]; if(t) responderTarjeta("Me gusta: " + t.it.nombre, true); });
@@ -8038,14 +8775,26 @@ function pintarUsoHTML(j){
       // Gpto con CRÉDITOS comprados (19-set-2026): el cupo puede estar al 100% y Codex sigue
       // por el saldo. El tubo muestra el % del plan y, al lado, los créditos; y no va en rojo.
       const esGpto = p.eti === "Gpto", conCreditos = esGpto && (d.creditos || 0) > 0;
+      // Claude con CRÉDITOS DE USO (21-set-2026): el usuario cargó saldo y subió el tope mensual;
+      // el tubo muestra el % del plan y, al lado, los USD que quedan del mes. No va en rojo.
+      const x = p.eti === "Claude" && d.extra_habilitado ? (d.extra || null) : null;
+      const quedanUsd = x ? Math.max(0, x.tope_usd - x.gastado_usd) : 0;
+      const conExtra = !!x && !x.agotado && quedanUsd > 0;
       const num = esHiggs && d.creditos != null ? miles(d.creditos) + "cr"
                 : conCreditos ? Math.round(t.pct) + "% +" + miles(d.creditos) + "cr"
+                : conExtra ? Math.round(t.pct) + "% +$" + miles(quedanUsd) + " margen"
                 : Math.round(t.pct) + "%";
-      const pctRojo = !conCreditos && (clase === "rojo" || t.pct >= 100);
+      const pctRojo = !conCreditos && !conExtra && (clase === "rojo" || t.pct >= 100);
       const tipCreditos = conCreditos
         ? "\ncréditos comprados: " + miles(d.creditos) + (d.creditos_mensajes && d.creditos_mensajes.length === 2
             ? " (≈ " + d.creditos_mensajes[0] + "–" + d.creditos_mensajes[1] + " mensajes)" : "")
           + (d.sigue_por_creditos ? "\nel cupo del plan está tocado: Gpto sigue por los créditos" : "")
+        : x
+        ? "\ncréditos de uso: USD " + coma(x.gastado_usd.toFixed(2)) + " gastados de USD " +
+          miles(x.tope_usd) + " del mes (" + Math.round(x.pct) + "%)"
+          + "\n(+$" + miles(quedanUsd) + " es el MARGEN que el tope mensual todavía autoriza; el saldo comprado no lo informa Anthropic)"
+          + (x.agotado ? "\n⚠ TOPE MENSUAL DE CRÉDITOS AGOTADO"
+             : d.sigue_por_creditos ? "\nel cupo semanal está lleno: Cacho sigue por los créditos mientras quede saldo comprado" : "")
         : "";
       return '<div class="u-lin" title="' + esc(tip + tipCreditos) + '">' +
         '<span class="u-eti">' + esc(p.eti) + '</span>' +
@@ -8057,6 +8806,7 @@ function pintarUsoHTML(j){
     }).join("");
 }
 async function pintarUso(){
+  if(enJaula()) return;            // los cupos de los modelos son de la casa
   try{
     const r = await fetch("/api/uso");
     pintarUsoHTML(await r.json());
@@ -8077,15 +8827,90 @@ function charlaDelLink(){
 async function abrirAviso(cid){
   const p = estado.proyectos[0];
   if(!p){ aviso("No encuentro la carpeta del proyecto para abrir la charla", true); return false; }
-  // De qué ventana viene el link: `?de=xara` (Administración) o `?de=eterna` (supervisores,
-  // 18-set-2026). Para una persona enjaulada el server pisa el área con la de su jaula; esto
-  // decide sólo cuando el que toca el link es el usuario.
+  // De qué ventana viene el link: `?de=xara` (Administración), `?de=eterna` (supervisores,
+  // 18-set-2026) o `?de=waldemar` (la mercadería, 22-set-2026). Para una persona enjaulada el
+  // server pisa el área con la de su jaula; esto decide sólo cuando el que toca el link es el usuario.
   const de = new URLSearchParams(location.search).get("de");
-  return !!(await nueva(p.cwd, de === "eterna" ? "eterna" : "xara", cid));
+  return !!(await nueva(p.cwd, (de === "eterna" || de === "waldemar") ? de : "xara", cid, "", "aviso"));
+}
+
+/* ── El tablero de la obra (Constructora, 22-set-2026) ────────────────────────────────
+   Qué se muestra NO se decide acá: `tools/tablero.py` en la casa del Negro devuelve una
+   lista de tarjetas y cada una dice cómo quiere verse (numero · barras · tabla · lista).
+   Guayabo agrega o saca tarjetas cuando el Negro le pide ver algo nuevo, y esta pantalla
+   no se toca. Por eso el pintor entiende FORMAS, no temas: si mañana hay una tarjeta de
+   alquileres, se pinta sola.
+   Una tarjeta que falla muestra SU error y las demás se pintan igual: un recuadro en
+   blanco no dice si no hay datos o si se rompió algo. */
+function tobRenglon(f, maxN, frio){
+  const pct = (f.pct !== undefined && f.pct !== null) ? Math.max(0, Math.min(100, f.pct))
+            : (maxN > 0 && f.n ? Math.round(f.n * 100 / maxN) : 0);
+  const der = [];
+  if(f.valor) der.push('<span class="v">' + esc(f.valor) + '</span>');
+  const d = [f.texto, f.detalle].filter(Boolean).join(" · ");
+  if(d) der.push('<span class="d">' + esc(d) + '</span>');
+  return '<div class="ren"><div class="l"><span class="n">' + esc(f.nombre) + '</span>'
+       + der.join("") + '</div>'
+       + (pct > 0 ? '<div class="tubo' + (frio ? ' frio' : '') + '"><i style="width:'
+                    + pct + '%"></i></div>' : '')
+       + '</div>';
+}
+function tobTarjeta(t){
+  const cab = '<h4>' + esc(t.titulo || t.id) + '</h4>';
+  if(t.error) return '<div class="tob">' + cab + '<div class="mal">⚠ ' + esc(t.error) + '</div></div>';
+  if(t.filas && t.filas.length){
+    const maxN = Math.max.apply(null, t.filas.map(f => f.n || 0).concat([0]));
+    const frio = t.vista === "tabla";   // los contenedores: avance, no plata gastada
+    const ancho = t.vista === "tabla" ? " ancho" : "";
+    return '<div class="tob' + ancho + '">' + cab
+         + t.filas.map(f => tobRenglon(f, maxN, frio)).join("")
+         + (t.sub ? '<div class="sub">' + esc(t.sub) + '</div>' : '') + '</div>';
+  }
+  if(t.vista === "numero")
+    return '<div class="tob">' + cab + '<div class="grande">' + esc(t.valor || "—") + '</div>'
+         + (t.sub ? '<div class="sub">' + esc(t.sub) + '</div>' : '') + '</div>';
+  return '<div class="tob">' + cab + '<div class="nada">'
+       + esc(t.vacio || "Nada para mostrar.") + '</div></div>';
+}
+async function pintarTableroObra(){
+  const caja = $("#tablero-obra");
+  if(!caja || caja.hidden) return;
+  let d;
+  try{
+    const r = await fetch("/api/tablero");
+    d = await r.json();
+    if(d.error) throw new Error(d.error);
+  }catch(e){
+    $("#tob-res").textContent = "(no pude armarlo: " + e.message + ")";
+    return;
+  }
+  const cuerpo = $("#tob-cuerpo");
+  cuerpo.innerHTML = (d.tarjetas || []).map(tobTarjeta).join("");
+  cuerpo.classList.toggle("hay-mas", cuerpo.scrollHeight > cuerpo.clientHeight + 4);
+  const rotas = (d.tarjetas || []).filter(t => t.error).length;
+  const resumen = (d.tarjetas || []).find(t => t.vista === "numero" && t.valor);
+  $("#tob-res").textContent =
+    (resumen ? esc(resumen.titulo).toLowerCase() + ": " + resumen.valor + " · " : "")
+    + (d.cuando || "") + (rotas ? " · " + rotas + " tarjeta(s) con problema" : "");
 }
 
 (async () => {
   await refrescar();
+  // La obra: sólo en la ventana de la Constructora. El plegado se acuerda de cómo lo dejaron.
+  if(document.body.classList.contains("perfil-constructora")){
+    const caja = $("#tablero-obra");
+    caja.hidden = false;
+    try{ if(localStorage.getItem("obra_tablero") === "1") caja.classList.add("plegado"); }catch(e){}
+    $("#tob-fl").textContent = caja.classList.contains("plegado") ? "▸" : "▾";
+    $("#tob-cab").onclick = () => {
+      caja.classList.toggle("plegado");
+      const pl = caja.classList.contains("plegado");
+      $("#tob-fl").textContent = pl ? "▸" : "▾";
+      try{ localStorage.setItem("obra_tablero", pl ? "1" : "0"); }catch(e){}
+    };
+    pintarTableroObra();
+    setInterval(pintarTableroObra, 5 * 60 * 1000);
+  }
   const cid = charlaDelLink();
   if(cid && await abrirAviso(cid)){
     // nada más que hacer en el arranque: la pestaña de la charla ya está al frente
@@ -8148,6 +8973,15 @@ if __name__ == "__main__":
     # pisaría la lista del cierre anterior con «cero pestañas» y no se reabriría nada.
     threading.Thread(target=_foto_pestanas_periodica, daemon=True).start()
     threading.Thread(target=_autocierre_periodico, daemon=True).start()
+    # El techo sale de la RAM de ESTA máquina: que quede en el log, si no el día que
+    # alguien vea un 429 no hay forma de saber con qué número estaba corriendo.
+    # Va por stderr como todo lo del server: stdout acá no es una tty y queda
+    # bufferizado — un dato que aparece media hora después no sirve para nada.
+    print("techo de pestañas: %d (RAM de la máquina) · hasta %d de las jaulas "
+          "(%s) · el resto es del usuario" % (
+              MAX_TABS, CUPO_JAULAS_TOTAL,
+              " ".join("%s %d" % (k, v) for k, v in CUPO_JAULA.items())),
+          file=sys.stderr)
     print(f"Cacho en http://{BIND}:{PORT}  (Ctrl-C para cortar)")
     try:
         server.serve_forever()

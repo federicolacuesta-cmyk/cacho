@@ -58,6 +58,48 @@ ESPERA_LLEGADA_S = 25   # cuánto se espera ver el prompt registrado después de
 CLAVE_PANEL = "cacho-lanzar"
 
 
+def quien_lanza():
+    """`script:<nombre>` — QUÉ script está abriendo la pestaña, para que Cacho lo anote al
+    nacer (21-set-2026, el usuario: «se disparan sesiones solas»). Si este módulo se importó, el
+    script es el programa principal (`sys.argv[0]`); si se corrió como comando, es el
+    proceso PADRE (el .py o el job de launchd que lo llamó). Nunca lanza: es trazabilidad."""
+    nombre = ""
+    try:
+        principal = os.path.basename(sys.argv[0] or "")
+        if principal.endswith((".py", ".sh")) and principal != os.path.basename(__file__):
+            nombre = principal
+        else:
+            padre = subprocess.run(["ps", "-o", "command=", "-p", str(os.getppid())],
+                                   capture_output=True, text=True, timeout=5).stdout.strip()
+            partes = [x for x in padre.split() if not x.startswith("-")]
+            # «python3 tools/x.py …» → x.py; «/bin/zsh -c …» → zsh
+            for x in partes[1:] or partes[:1]:
+                nombre = os.path.basename(x)
+                if nombre.endswith((".py", ".sh")):
+                    break
+            if nombre == "launchd":
+                # El padre es launchd: el JOB es la identidad, no el supervisor (Policía
+                # 21-set-2026: enriquecer-diario, blog-salud-visual, auditoria-mensual y
+                # enriquecer-mensual ejecutan este archivo y los cuatro quedaban «launchd»).
+                # launchd no pone el label en el entorno (XPC_SERVICE_NAME=0, probado), pero
+                # `launchctl list` lista PID y label de lo que está corriendo.
+                nombre = _job_launchd() or nombre
+    except Exception:
+        nombre = ""
+    return "script:" + (nombre or "?")[:60]
+
+
+def _job_launchd():
+    """El label del job de launchd que corre este proceso (o su padre), por `launchctl list`."""
+    pids = {str(os.getpid()), str(os.getppid())}
+    out = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=5).stdout
+    for lin in out.splitlines():
+        partes = lin.split("\t")
+        if len(partes) >= 3 and partes[0] in pids:
+            return partes[2].strip()
+    return ""
+
+
 def _get(path, timeout=3):
     with urllib.request.urlopen(BASE + path, timeout=timeout) as r:
         return r.read()
@@ -224,7 +266,7 @@ def crear_pestana(modelo="", area="", conectores=()):
     area = exigir_area(area)
     if not ping(silencioso=True) and not levantar_server():
         raise RuntimeError("El server de Cacho no levanta (ver %s)" % LOG)
-    ruta = "/api/term/new?cwd=%s&area=%s" % (quote(os.getcwd()), quote(area))
+    ruta = "/api/term/new?cwd=%s&area=%s&por=%s" % (quote(os.getcwd()), quote(area), quote(quien_lanza()))
     if modelo:
         ruta += "&modelo=%s" % quote(modelo)
     if conectores:
@@ -401,6 +443,19 @@ def confirmar_llegada(tid, texto, desde, esperar=ESPERA_LLEGADA_S):
             sid = p.get("sid") or sid
         except Exception:  # noqa: BLE001 — si el server no contesta, se sigue con lo que había
             pass
+    # «QUEDÓ EN LA COLA» NO ES UN FALLO (22-set-2026). Una pestaña que está TRABAJANDO no
+    # registra el prompt en su transcript hasta que termina el turno: el CLI lo tiene en la
+    # cola de entrada y lo toma después. Los 25 s alcanzan para una pestaña quieta y no para
+    # una ocupada, así que esto gritaba «NO llegó» sobre pedidos que habían llegado —pasó con
+    # el complemento del encargo de Waldemar (c1b4c3b4), verificado a mano en el transcript—.
+    # Antes de dar un pedido por perdido se le pregunta al server si la pestaña está ocupada.
+    try:
+        if (_pestana(tid).get("estado") or "") == "trabajando":
+            print("• La pestaña %s está trabajando: el pedido le queda en la cola y lo toma al "
+                  "terminar el turno." % tid, file=sys.stderr)
+            return "cola"
+    except Exception:  # noqa: BLE001 — si el server no contesta, seguimos al camino de fallo
+        pass
     detalle = ("Pestaña %s (%s). Ni el transcript de claude (%s) ni ~/.codex/history.jsonl "
                "registraron el pedido en %d s después del Enter. Casi siempre es un diálogo "
                "del CLI (trust hook, permisos, «press t») que se comió el paste.\n"
@@ -415,7 +470,7 @@ def confirmar_llegada(tid, texto, desde, esperar=ESPERA_LLEGADA_S):
                         accion="Abrí la pestaña %s en Cacho, destrabá el diálogo y retipeá el "
                                "pedido (si el que la lanzó ya la cerró, relanzalo); después ✓ "
                                "acá." % tid,
-                        asunto="perdido:%s" % tid)
+                        asunto="perdido:%s" % tid, para="casa")
     except Exception as e:  # noqa: BLE001 — el panel no puede tapar el error de verdad
         print("(no pude dejar la alerta en el panel: %r)" % e, file=sys.stderr)
     raise RuntimeError("El prompt NO llegó a la pestaña %s: %s" % (tid, detalle.split("\n")[0]))
@@ -444,13 +499,70 @@ def con_memoria_del_area(prompt, area=""):
     return agente_arranque.linea_de_prompt(area) + prompt
 
 
-def lanzar(prompt, area="", conectores=()):
+ENCARGOS = os.path.join(PROJ, "logs", "sesiones", "encargos")
+ENCARGO_VENCE_H = 6      # tomado hace más de esto: la pestaña quedó abierta pero el encargo se re-entrega
+
+
+def _tabs_vivas():
+    """Los ids de pestaña que el server tiene AHORA, o None si no pude preguntarle.
+
+    None no es lo mismo que «ninguna» (regla de la casa: «no lo vi» nunca es un valor).
+    """
+    try:
+        est = _get_auth("/api/estado")
+        return {t.get("id") for t in (est.get("tabs") or [])}
+    except Exception:                                # noqa: BLE001
+        return None
+
+
+def quien_tiene(encargo):
+    """El id de la pestaña VIVA que ya está con este encargo, o '' si no lo tiene nadie.
+
+    RAÍZ (22-set-2026): el vigía de memoria entregó el MISMO mantenimiento a dos pestañas, que
+    lo hicieron en paralelo y casi se pisan los commits. El prompt le pedía al agente «no abras
+    otra pestaña», pero nada frenaba al VIGÍA, que vuelve a entregar en cuanto el cuadro cambia
+    (y el cuadro cambia justo cuando el que está trabajando arregla o agrega un hallazgo).
+
+    Si no se puede preguntar al server, devuelve '' A PROPÓSITO: duplicar un encargo es molesto,
+    perderlo es peor.
+    """
+    try:
+        with open(os.path.join(ENCARGOS, "%s.json" % encargo), encoding="utf-8") as fh:
+            reg = json.load(fh)
+    except (OSError, ValueError):
+        return ""
+    if time.time() - reg.get("cuando", 0) > ENCARGO_VENCE_H * 3600:
+        return ""
+    vivas = _tabs_vivas()
+    if vivas is None or reg.get("tid") not in vivas:
+        return ""
+    return reg["tid"]
+
+
+def _tomar(encargo, tid):
+    try:
+        os.makedirs(ENCARGOS, exist_ok=True)
+        with open(os.path.join(ENCARGOS, "%s.json" % encargo), "w", encoding="utf-8") as fh:
+            json.dump({"tid": tid, "cuando": time.time(), "por": quien_lanza()}, fh)
+    except OSError as e:                             # noqa: BLE001
+        print("⚠️ no pude anotar el encargo %s: %r" % (encargo, e), file=sys.stderr)
+
+
+def lanzar(prompt, area="", conectores=(), encargo=""):
     """Crea la pestaña y le deja el prompt corriendo. Devuelve el id de pestaña.
     `area` es obligatoria (ver `crear_pestana`): sin ella, ValueError antes de tocar el server.
-    `conectores`: extra puntual de conectores MCP por fuera de la tabla del área."""
+    `conectores`: extra puntual de conectores MCP por fuera de la tabla del área.
+    `encargo`: clave del trabajo. Si una pestaña VIVA ya lo tiene, NO se abre otra y se devuelve
+    la que lo tiene (ver `quien_tiene`)."""
     area = exigir_area(area)
+    if encargo:
+        ya = quien_tiene(encargo)
+        if ya:
+            return ya
     tid = crear_pestana(area=area, conectores=conectores)
     tipear(tid, con_memoria_del_area(prompt, area))
+    if encargo:
+        _tomar(encargo, tid)
     return tid
 
 
@@ -464,6 +576,13 @@ def main():
     # `--conector <nombre>` (repetible, antes del prompt): un conector MCP extra para esta
     # pestaña, por fuera de la tabla de su área (18-set-2026). Queda en el log del server.
     conectores = []
+    # `--encargo <clave>`: si una pestaña VIVA ya tiene este mismo trabajo, NO se abre otra
+    # (22-set-2026: el vigía de memoria entregó el mantenimiento a dos pestañas a la vez).
+    encargo = ""
+    while argv[:2] and argv[0] == "--encargo":
+        if not argv[1].strip():
+            raise SystemExit('Uso: cacho_lanzar.py [--encargo <clave>] "<prompt>" <area>')
+        encargo, argv = argv[1].strip(), argv[2:]
     while argv[:1] == ["--conector"]:
         if len(argv) < 2 or not argv[1].strip():
             raise SystemExit('Uso: cacho_lanzar.py [--conector <nombre>]… "<prompt>" <area>')
@@ -474,13 +593,13 @@ def main():
             raise SystemExit('Uso: cacho_lanzar.py --en <pestaña> "<prompt>" [area]')
         en, argv = argv[1].strip(), argv[2:]
     if not argv or not argv[0].strip():
-        raise SystemExit('Uso: cacho_lanzar.py [--en <pestaña>] "<prompt>" <area>')
+        raise SystemExit('Uso: cacho_lanzar.py [--encargo <clave>] [--en <pestaña>] "<prompt>" <area>')
     # Un flag donde va el prompt (`--help`, `-h`, un `--area` inventado) NO es un pedido:
     # sin esto, `cacho_lanzar.py --help` abría una pestaña de Opus con «--help» como
     # encargo (pasó tres veces, 12/13/16-set-2026: sesiones 1f42f733, 6ad650ae y una más).
     # El prompt es texto de una persona o de una rutina; nunca empieza con guion.
     if argv[0].lstrip().startswith("-"):
-        raise SystemExit('Uso: cacho_lanzar.py [--en <pestaña>] "<prompt>" <area>\n'
+        raise SystemExit('Uso: cacho_lanzar.py [--encargo <clave>] [--en <pestaña>] "<prompt>" <area>\n'
                          "El prompt no puede empezar con «-» (recibí %r)." % argv[0][:40])
     if en:
         try:
@@ -496,15 +615,22 @@ def main():
     # nombre del script a la vista — un typo en un plist tiene que gritar, no clasificar mal
     # en silencio.
     if len(sys.argv) < 3 or not sys.argv[2].strip():
-        raise SystemExit('Uso: cacho_lanzar.py [--en <pestaña>] "<prompt>" <area>\n'
+        raise SystemExit('Uso: cacho_lanzar.py [--encargo <clave>] [--en <pestaña>] "<prompt>" <area>\n'
                          "Falta el ÁREA (cacho, carla, jaime, eterna, waldemar, xara, ferguson…): "
                          "desde el 18-set-2026 es obligatoria, el que abre la pestaña sabe de "
                          "quién es el trabajo.")
     try:
         area = exigir_area(sys.argv[2])
+        if encargo:
+            ya = quien_tiene(encargo)
+            if ya:
+                print(f"OK — el encargo «{encargo}» ya lo tiene la pestaña {ya}; no abro otra.")
+                return
         tid = crear_pestana(area=area, conectores=tuple(conectores))
         print(f"pestaña {tid} creada; esperando que levante claude ({ESPERA_CLAUDE_S}s)…")
         tipear(tid, con_memoria_del_area(sys.argv[1].strip(), area))
+        if encargo:
+            _tomar(encargo, tid)
     except (RuntimeError, ValueError) as e:
         raise SystemExit(str(e)) from e
     print(f"OK — tarea corriendo en Cacho (pestaña {tid}).")

@@ -90,17 +90,24 @@ AREAS = [
                      "reunión de encargados"],
     },
     {
-        "clave": "waldemar", "nombre": "Waldemar", "rol": "Producto",
+        "clave": "waldemar", "nombre": "Waldemar", "rol": "Producto y Depósito",
         "gente": "la mercadería", "color": "#9D1DFF", "cara": "waldemar.png",
+        # UNA SOLA ÁREA para la mercadería (el usuario, 22-set-2026): Waldemar compra (con Brian) y
+        # mueve el depósito (con Gabriel y Rodolfo, `?de=waldemar`).
         # No se pisa con Eterna ni con Xara aunque compartan vocabulario: «stock» a
         # secas sigue siendo del mostrador (Eterna) y «proveedor» del que hay que
-        # pagarle (Xara). Lo de Waldemar es el VERBO DE COMPRA.
+        # pagarle (Xara). Lo de Waldemar es el VERBO DE COMPRA y el depósito con sus remitos.
         "propias": ["waldemar", "reposicion", "reposición", "surtido", "sobrestock",
                     "rotacion", "rotación", "stock muerto", "lista de precios",
-                    "mayorista", "coleccion", "colección", "que comprar", "qué comprar"],
+                    "mayorista", "coleccion", "colección", "que comprar", "qué comprar",
+                    "deposito", "depósito", "remito", "remitos", "averia", "avería",
+                    "averias", "averías", "reposicion a los locales",
+                    "reposición a los locales", "gabriel", "rodolfo", "en viaje"],
         "palabras": ["comprar", "compra de", "catalogo", "catálogo", "importacion",
                      "importación", "temporada", "liquidar", "outlet",
-                     "cobertura de stock", "producto nuevo"],
+                     "cobertura de stock", "producto nuevo", "stock del deposito",
+                     "stock del depósito", "mandar a los locales", "que le mando",
+                     "qué le mando", "para el sistema", "cargar renglones"],
     },
     {
         "clave": "xara", "nombre": "Xara", "rol": "Administración",
