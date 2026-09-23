@@ -14,6 +14,21 @@ color. Tocás una cara y ves sólo lo de ese sector.
 Doble clic en **`INSTALAR.command`**. Te va a preguntar el nombre de la empresa, a qué se
 dedica, y te propone arrancar con tres agentes: Administración, Logística y Ventas.
 
+Si preferís que no pregunte nada (o si se lo pedís a un asistente que no tiene a quién
+preguntarle), se le dice todo de una:
+
+```bash
+bash instalar.sh --sin-preguntar \
+  --empresa "Mi empresa SA" \
+  --sectores "Administración,Logística,Ventas" \
+  --perfil ~/Downloads/mi-empresa.md
+```
+
+`--perfil` es un archivo de texto que contás **a qué se dedica la empresa y qué es lo que
+se puede arruinar**. Entra entero al `CLAUDE.md` que leen todos los agentes, y es la
+diferencia entre un asistente que contesta genérico y uno que sabe de qué vivís. Si no
+tenés uno a mano, `--rubro "una línea"` alcanza para arrancar.
+
 Cuando termina queda **Cacho.app** en `~/Applications`. Arrastrala al Dock.
 
 ---
@@ -130,6 +145,26 @@ primero. Ejemplo de una línea buena en la memoria de Logística:
 
 Lo más cómodo es no escribirlos a mano: cuando un agente aprenda algo que no se puede
 olvidar, decile **«anotá esto en tu memoria»**.
+
+---
+
+## El policía
+
+Antes de que algo que se cambió se empiece a usar, conviene que lo lea alguien que no lo
+escribió. Eso hace `revisar.py`:
+
+```bash
+cd ~/Claude/cacho && python3 revisar.py            # lo que cambió en esta carpeta
+python3 revisar.py ~/donde/sea/archivo.py          # un archivo cualquiera
+```
+
+Te marca en 🔴 lo que está mal y se va a notar —cuentas equivocadas, algo que rompe, un
+error que se traga en silencio, una contraseña adentro del código— y en 🟡 lo que va a
+confundir dentro de tres meses.
+
+**El que revisa no escribe.** El policía no toca ni un archivo: te muestra lo que
+encontró y arreglarlo lo decidís vos. Si no encuentra nada, lo dice y se calla; no
+inventa para justificar la pasada.
 
 ---
 

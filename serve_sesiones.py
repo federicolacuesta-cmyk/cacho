@@ -2225,8 +2225,16 @@ def _techo_pestanas(ram_gb=None):
             print(f"⚠️ no pude medir la RAM ({exc!r}): techo de pestañas en el piso "
                   f"({TECHO_MIN})", file=sys.stderr)
             return TECHO_MIN
-    cabe = int((ram_gb - RESERVA_CASA_GB) / RAM_POR_PESTANA_GB)
-    return max(TECHO_MIN, min(TECHO_MAX, cabe))
+    # La reserva de 20 GB es de ESTA casa (Chrome, los ~107 jobs, el Espejo, Playwright).
+    # En una máquina ajena y chica no hay nada de eso, y restarle 20 a una de 8 GB da
+    # negativo: el cálculo se caía al piso de 12 y le prometía a una MacBook Air doce
+    # pestañas — 8,4 GB sólo de pestañas, o sea colgarla. La reserva es lo MENOR entre los
+    # 20 de acá y el 45 % de la máquina, y el piso también baja: en una máquina chica el
+    # piso honesto es «dos», no doce. (RAÍZ 23-set-2026, la Air M2 de 8 GB de Polticor.)
+    reserva = min(RESERVA_CASA_GB, ram_gb * 0.45)
+    piso = TECHO_MIN if ram_gb >= 32 else max(2, int(ram_gb / 4))
+    cabe = int((ram_gb - reserva) / RAM_POR_PESTANA_GB)
+    return max(piso, min(TECHO_MAX, cabe))
 
 
 MAX_TABS = _techo_pestanas()   # techo de pestañas simultáneas (ver /api/term/new)

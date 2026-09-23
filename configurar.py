@@ -29,6 +29,7 @@ octava, conviene sacar otra antes.
 from __future__ import annotations
 
 import json
+import io
 import os
 import re
 import sys
@@ -100,7 +101,8 @@ OFICIOS = {
     "personal": {
         "rol": "Personal", "gente": "el equipo", "color": "#2E9E5B",
         "propias": ["personal", "recursos humanos", "rrhh", "sueldo", "nomina",
-                    "nómina", "licencia", "ausentismo", "contratacion", "contratación"],
+                    "nómina", "licencia", "ausentismo", "contratacion", "contratación",
+                    "certificado medico", "certificado médico"],
         "palabras": ["horario", "turno", "vacaciones", "certificado", "altas y bajas",
                      "capacitacion", "capacitación", "franco"],
     },
@@ -110,6 +112,27 @@ OFICIOS = {
                     "maquina", "máquina", "mantenimiento", "merma"],
         "palabras": ["lote", "insumo", "calidad", "retrabajo", "linea", "línea",
                      "capacidad", "turno de produccion", "turno de producción"],
+    },
+    "operaciones": {
+        "rol": "Operaciones", "gente": "las cuadrillas y los camiones", "color": "#2E9E5B",
+        "propias": ["operaciones", "cuadrilla", "recorrido", "hoja de ruta",
+                    "servicio programado", "contenedor", "volqueta", "planta",
+                    "habilitacion", "habilitación", "disposicion final",
+                    "disposición final"],
+        "palabras": ["chofer", "camion", "camión", "ruta", "levante", "recoleccion",
+                     "recolección",
+                     "frecuencia", "pesaje", "tonelada", "planilla de servicio",
+                     "combustible", "neumatico", "neumático", "taller"],
+    },
+    "licitaciones": {
+        "rol": "Licitaciones", "gente": "el Estado y los pliegos", "color": "#9D1DFF",
+        "propias": ["licitacion", "licitación", "pliego", "compras estatales", "ampliacion",
+                    "ampliación", "adjudicacion", "adjudicación", "oferta economica",
+                    "oferta económica", "garantia de mantenimiento",
+                    "garantía de mantenimiento", "rupe"],
+        "palabras": ["apertura", "acta", "contrato", "prorroga", "prórroga", "renovacion",
+                     "renovación", "intendencia", "ministerio", "organismo", "aclaracion",
+                     "aclaración", "impugnacion", "impugnación"],
     },
     "sistemas": {
         "rol": "Sistemas", "gente": "vos y la máquina", "color": "#C96442",
@@ -162,6 +185,30 @@ def clave_de(nombre):
 # lugar, y esa clave va recortada a 12 letras porque es lo que `areas.valida()` acepta.
 # (Sin esto, «Administración» daba «administraci» y no encontraba su propio vocabulario.)
 POR_OFICIO = {clave_de(k): v for k, v in OFICIOS.items()}
+
+# La misma área tiene nombres distintos según la casa: «Comercial» y «Ventas» son lo
+# mismo, «RRHH» es «Personal». Sin esto, un sector escrito con el otro nombre nacía SIN
+# vocabulario —o sea sin poder adivinar a dónde va una charla— y nadie entendía por qué
+# su «Comercial» no agarraba nada mientras el «Ventas» del vecino sí.
+SINONIMOS = {
+    "comercial": "ventas", "atencion": "ventas", "postventa": "ventas",
+    "rrhh": "personal", "gentey": "personal", "talento": "personal",
+    "contable": "administracion", "finanzas": "administracion",
+    "tesoreria": "administracion", "facturacion": "administracion",
+    "flota": "logistica", "transporte": "logistica", "reparto": "logistica",
+    "distribucion": "logistica", "deposito": "logistica",
+    "taller": "produccion", "manten": "produccion", "planta": "produccion",
+    "abastecimiento": "compras", "suministros": "compras",
+    "it": "sistemas", "informatica": "sistemas", "tecnologia": "sistemas",
+    "obras": "operaciones", "servicios": "operaciones", "campo": "operaciones",
+    "ambiental": "operaciones", "seguridad": "operaciones",
+    "contratos": "licitaciones", "estado": "licitaciones",
+}
+
+
+def oficio_de(clave):
+    """El vocabulario que le toca a este sector, directo o por sinónimo. {} si es uno raro."""
+    return POR_OFICIO.get(clave) or POR_OFICIO.get(SINONIMOS.get(clave, ""), {})
 
 
 def preguntar(texto, defecto=""):
@@ -523,7 +570,87 @@ def elegir_agente(cfg, verbo):
     return None
 
 
+def desde_los_flags(argv):
+    """Lo mismo que preguntar, pero por línea de comandos.
+
+    RAÍZ (23-set-2026): el asistente de la otra empresa no pudo instalar Cacho porque
+    `configurar.py` hace preguntas y un agente no tiene a quién preguntarle — se quedó a
+    mitad de camino y tuvo que pedirle a su dueña que lo corriera a mano. Un instalador
+    que SÓLO sabe hablar con una persona no lo puede correr una máquina."""
+    import argparse
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--empresa")
+    ap.add_argument("--rubro")
+    ap.add_argument("--perfil", help="archivo .md con el perfil de la empresa; reemplaza "
+                                     "a --rubro y entra ENTERO al CLAUDE.md")
+    ap.add_argument("--sectores", help="separados por coma")
+    ap.add_argument("--sin-preguntar", action="store_true", dest="callado")
+    ap.add_argument("-h", "--help", action="store_true", dest="ayuda")
+    a, sobra = ap.parse_known_args(argv)
+    if a.ayuda:
+        print(__doc__)
+        sys.exit(0)
+    if sobra:
+        print("No conozco: %s" % " ".join(sobra))
+        sys.exit(2)
+    if a.callado and not (a.empresa and a.sectores):
+        print("Con --sin-preguntar hacen falta al menos --empresa y --sectores.")
+        sys.exit(2)
+    if a.perfil:
+        # Un rubro de una línea da un CLAUDE.md genérico, y un agente que no sabe de qué
+        # vive la empresa contesta genérico toda su vida. El perfil se escribe UNA vez, en
+        # un archivo, y entra entero. Si el archivo no está, se para acá: seguir sin él
+        # deja el proyecto armado y mudo, que es el error que no se ve.
+        try:
+            a.rubro = io.open(os.path.expanduser(a.perfil), encoding="utf-8").read().strip()
+        except OSError as e:
+            print("No pude leer el perfil %s: %s" % (a.perfil, e))
+            sys.exit(2)
+        if not a.rubro:
+            print("El perfil %s está vacío." % a.perfil)
+            sys.exit(2)
+    return a
+
+
+def armar_agente(cfg, sector):
+    """Un agente listo, sin preguntar nada: si el sector es uno de los conocidos hereda su
+    vocabulario; si no, queda con el nombre como única palabra propia y se edita después."""
+    clave = clave_de(sector)
+    if clave in {x["clave"] for x in cfg["agentes"]}:
+        return None
+    o = oficio_de(clave)
+    color = o.get("color") or PALETA[len(cfg["agentes"]) % len(PALETA)][1]
+    cara = clave + ".png"
+    caras.png(caras.iniciales_de(sector), color, os.path.join(STATIC, cara))
+    return {"clave": clave, "nombre": sector, "rol": o.get("rol", sector),
+            "gente": o.get("gente", ""), "color": color, "cara": cara,
+            "propias": o.get("propias", [_sin_tildes(sector)]),
+            "palabras": o.get("palabras", [])}
+
+
 def main():
+    flags = desde_los_flags(sys.argv[1:])
+    if flags.callado:
+        cfg = cargar()
+        cfg["empresa"] = flags.empresa
+        cfg["rubro"] = flags.rubro or cfg.get("rubro", "")
+        for sector in [s.strip() for s in flags.sectores.split(",") if s.strip()]:
+            a = armar_agente(cfg, sector)
+            if a:
+                cfg["agentes"].append(a)
+        guardar(cfg)
+        ruta = escribir_areas(cfg)
+        import py_compile
+        import subprocess
+        py_compile.compile(ruta, doraise=True)
+        subprocess.run([sys.executable, ruta], check=True,
+                       stdout=subprocess.DEVNULL, cwd=AQUI)
+        proyecto = escribir_proyecto(cfg)
+        print("Listo, sin preguntar: %s · %d agentes (%s) · %s"
+              % (cfg["empresa"], len(cfg["agentes"]),
+                 ", ".join(x["nombre"] for x in cfg["agentes"]), proyecto))
+        return
+
     print("\n" + "=" * 68)
     print("  Cacho — configurar los agentes de tu empresa")
     print("=" * 68)
