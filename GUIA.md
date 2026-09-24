@@ -148,6 +148,102 @@ olvidar, decile **«anotá esto en tu memoria»**.
 
 ---
 
+## Cómo conectarle información
+
+Enseñarle cómo se trabaja (lo de arriba) es la mitad. La otra mitad es **de dónde saca los
+datos**: un agente sin los números de tu empresa es un chat más.
+
+Hay cuatro puertas. Conviene recorrerlas en este orden, que es el de menos a más trabajo:
+
+| Puerta | Qué es | Cuánto cuesta |
+|---|---|---|
+| **1. Carpetas** | Los archivos de tu Mac | Nada, ya funciona |
+| **2. MCP** | El conector de una app conocida | Un rato, y sin Terminal |
+| **3. API** | La puerta de tus sistemas propios | Días, y alguien que lo arme |
+| **4. Base en espejo** | Una copia de la base del sistema | Lo mismo, una sola vez |
+
+### 1. Las carpetas de tu Mac — ya la tenés
+
+Todo lo que esté en el disco, el agente lo abre solo: Excel, PDF, fotos, mails guardados.
+No hay nada que configurar. Y **Dropbox, Drive o OneDrive sincronizados son una carpeta
+más**: lo que se baja a la máquina se lee igual que el resto.
+
+Esta puerta es el 80% del valor del primer mes. Lo único que conviene hacer es ordenar:
+una carpeta por tema y decirle en cuál mirar.
+
+> Si un archivo te llega todos los meses, guardalo siempre en la misma carpeta y con el
+> mismo criterio de nombre (`2026-09 factura proveedor.pdf`). Un agente no adivina dónde
+> está algo, pero un orden lo entiende enseguida.
+
+### 2. MCP: el enchufe de una app
+
+Un **MCP** es un conector ya hecho para una aplicación conocida — Gmail, Google Drive,
+Calendar, Notion, Slack, tu tienda online. Se conecta una vez con el usuario de la empresa
+y desde ahí el agente entra solo a buscar: vos no le copiás ni le pegás nada.
+
+La diferencia con la puerta 1: en vez de mostrarle un papel, le das la llave del archivo.
+
+**La forma fácil, sin Terminal:** los conectores de tu cuenta de Claude. En
+[claude.ai](https://claude.ai) → **Configuración → Conectores**, los prendés con un clic y
+entrás con la cuenta de la empresa. Quedan disponibles en las charlas de Cacho.
+
+**Para lo que no esté en esa lista**, desde la Terminal:
+
+```bash
+claude mcp list                      # los que ya tenés, y si están andando
+claude mcp add --help                # cómo agregar uno nuevo
+claude mcp add-from-claude-desktop   # traer los que ya usabas en la app de escritorio
+```
+
+> **Poné sólo los que el sector usa.** Un agente con quince conectores tarda más y se
+> dispersa; uno con los tres que necesita va al grano.
+
+### 3. API: la puerta de tus sistemas
+
+El sistema con el que facturás, el ERP, el que maneja la operación, el banco. Eso no tiene
+conector hecho — y es justamente donde están los datos que no tiene nadie más. Por eso es
+la puerta que cambia decisiones.
+
+El camino es más corto de lo que parece:
+
+1. Preguntale al proveedor del sistema dos cosas: **«¿tiene API?»** y **«¿me pueden dar
+   acceso de lectura a la base?»**.
+2. Te va a dar una **clave** (la va a llamar *API key* o *token*) y un manual.
+3. Alguien escribe el pedacito de código que trae los datos y los deja en un archivo. Ese
+   alguien puede ser el propio agente: pegale el manual que te pasaron y pedíselo.
+
+**Que sea de sólo lectura.** Para mirar y sacar conclusiones alcanza con leer; permiso de
+escritura es riesgo sin beneficio hasta que sepas exactamente qué querés que escriba.
+
+### 4. La base de datos, en espejo
+
+Si el sistema tiene base propia, lo mejor no es leerla en vivo: es **copiarla a la Mac una
+vez por noche y leer la copia**. Dos razones, las dos importantes: ninguna equivocación del
+agente puede tocar lo que está funcionando, y una consulta pesada no le frena el sistema a
+la gente que está trabajando.
+
+Lo que sí hay que tener claro es hasta cuándo llega la copia. Si se hace a las 3 AM, el
+agente sabe hasta ayer — y tiene que decirlo cuando conteste, no dar el número de hoy como
+si lo tuviera.
+
+### Las claves no van en el chat
+
+Una clave de API pegada en una conversación queda escrita ahí para siempre. Van en un
+archivo de la máquina, y el código la busca ahí. Lo mismo para contraseñas y accesos a
+bancos. Si una se te escapó en un chat, pedile al proveedor que la dé de baja y sacá otra:
+lleva cinco minutos.
+
+### La regla que ahorra tres meses
+
+**No conectes todo de una.** Elegí UN proceso que tenga dos cosas juntas: plata visible y
+datos a mano. Conectale lo que ese proceso necesita y usalo 30 días. Recién ahí vas a saber
+qué pedirle de verdad, y el segundo proceso sale en una semana.
+
+Conectar diez fuentes el primer día termina siempre igual: un asistente impresionante que
+no cambió ninguna decisión.
+
+---
+
 ## El policía
 
 Antes de que algo que se cambió se empiece a usar, conviene que lo lea alguien que no lo
